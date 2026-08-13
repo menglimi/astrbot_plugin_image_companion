@@ -11989,7 +11989,7 @@ Output:
         local_backend_prompt_text = compile_local_photo_prompt(
             resolved_context.prompt_sections,
             prompt_format,
-        ) or prompt_text
+        ) or self._comfyui_renderable_prompt_text(prompt_text)
         reference_candidate = dict(resolved_context.reference or {})
         if structured_reference_plan:
             # The public generation record retains only the managed asset ID and
@@ -15093,7 +15093,9 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             if line:
                 values.append(line)
         cleaned = ", ".join(values).strip(" ,;，；.")
-        return cleaned or raw
+        # Never fall back to the orchestration envelope: it is precisely the
+        # metadata that local CLIP/T5 workflows must not render as an image.
+        return cleaned
 
     async def _select_photo_reference_image_async(
         self,
@@ -15192,12 +15194,46 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
     def _comfyui_reference_images_to_base64(
         image_paths: list[str],
     ) -> tuple[list[str], str]:
-        """Encode local reference files for ComfyUI's ETN_LoadImageBase64 nodes."""
+        """Normalize reference sources for ComfyUI's ETN_LoadImageBase64 nodes.
+
+        The workflow node accepts only the raw ASCII base64 payload.  Reference
+        sources can still be legacy local paths, data URLs, or base64 values
+        from an upstream adapter, so normalize them at this final boundary.
+        """
         encoded_images: list[str] = []
         for index, image_path in enumerate(image_paths, start=1):
+            source = str(image_path or "").strip()
+            if not source:
+                return [], f"ComfyUI 第 {index} 张参考图为空，已停止提交"
+            payload = ""
+            data_match = re.match(
+                r"^data:image/[^;]+;base64,(?P<payload>.+)$",
+                source,
+                flags=re.I | re.S,
+            )
+            if data_match:
+                payload = data_match.group("payload").strip()
+            elif source.lower().startswith(("base64://", "base64:")):
+                payload = source.split(":", 1)[1].lstrip("/").strip()
+            else:
+                try:
+                    source_is_file = Path(source).is_file()
+                except (OSError, ValueError):
+                    source_is_file = False
+                if not source_is_file and len(source) >= 256 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", source):
+                    # Accept raw base64 only when it is plausibly image-sized;
+                    # a short filename must never be mistaken for a payload.
+                    payload = re.sub(r"\s+", "", source)
+            if payload:
+                try:
+                    base64.b64decode(payload, validate=True)
+                except (ValueError, binascii.Error):
+                    return [], f"ComfyUI 第 {index} 张参考图的 Base64 数据无效，已停止提交"
+                encoded_images.append(payload)
+                continue
             try:
-                image_bytes = Path(image_path).read_bytes()
-            except OSError as exc:
+                image_bytes = Path(source).read_bytes()
+            except (OSError, ValueError) as exc:
                 logger.warning(
                     "[PrivateCompanion] ComfyUI 参考图读取失败: index=%s error=%s",
                     index,
