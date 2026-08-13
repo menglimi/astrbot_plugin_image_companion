@@ -1,0 +1,26 @@
+name: astrbot_plugin_image_companion
+display_name: 我会画给你看
+author: menglimi
+author_url: https://github.com/menglimi
+version: 0.1.0
+description: 面向 AstrBot 的图像生成扩展，支持文生图、自拍、人像改图、参考图库及多种生图后端，并可与“我会永远陪着你”协同使用。
+desc: AstrBot 图像生成扩展，支持文生图、改图、参考图库与多后端配置。
+repo: https://github.com/menglimi/astrbot_plugin_image_companion
+category: AI 增强
+tags:
+  - 陪伴体系
+  - 生图
+  - 改图
+  - 参考图库
+  - ComfyUI
+  - 图像生成
+support_platforms:
+  - aiocqhttp
+  - qq_official
+astrbot_version: ">=4.22.0"
+help: |
+  “我会画给你看”提供 AstrBot 图像生成能力，包括文生图、自拍、人像改图、参考图库和多后端配置。
+
+  与“我会永远陪着你”同时安装并启用后，陪伴插件中的生图请求会自动接入本插件；原有指令、会话范围和消息投递顺序保持不变。
+
+  首次启用时可读取旧版陪伴插件中的生图配置、额度、参考图库和生成归档，便于平滑迁移。未安装陪伴插件时，本插件仍可作为独立图像生成扩展使用，具体入口取决于当前 AstrBot 环境和已注册工具。

@@ -1,0 +1,993 @@
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass, field, is_dataclass, replace
+from functools import wraps
+from typing import Any, Awaitable, Callable
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+from astrbot.api.message_components import Image, Plain, Record
+from astrbot.core.agent.message import AssistantMessageSegment, TextPart
+from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.star.star import star_map
+from astrbot.core.star.star_handler import EventType, star_handlers_registry
+
+from .helpers import _format_history_media_marker, _now_ts, _single_line
+
+
+_DELIVERY_TASK_LABELS = frozenset({"segmented_llm_remainder"})
+
+
+@dataclass(slots=True)
+class DeliveryLedger:
+    """One logical outbound turn, independent of how many sends it uses."""
+
+    umo: str
+    event: AstrMessageEvent | None = None
+    passive: bool = False
+    confirmed_chains: list[list[Any]] = field(default_factory=list)
+    candidate_chain: list[Any] = field(default_factory=list)
+    background_tasks: set[asyncio.Task] = field(default_factory=set)
+    original_send: Any = None
+    original_send_streaming: Any = None
+    streaming: bool = False
+    context_token: contextvars.Token | None = None
+    fallback_task: asyncio.Task | None = None
+    final_chain_start: int | None = None
+    finalized: bool = False
+    finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def delivered_chain(self) -> list[Any]:
+        return [component for chain in self.confirmed_chains for component in chain]
+
+
+_CURRENT_DELIVERY: contextvars.ContextVar[DeliveryLedger | None] = (
+    contextvars.ContextVar("private_companion_final_delivery", default=None)
+)
+
+
+class FinalResponsePersistenceCoordinator:
+    """Collect platform-confirmed content and commit it to optional sinks."""
+
+    def __init__(self, owner: Any) -> None:
+        self.owner = owner
+
+    @staticmethod
+    def _event_ledger(event: AstrMessageEvent | None) -> DeliveryLedger | None:
+        if event is None:
+            return None
+        ledger = getattr(event, "_private_companion_delivery_ledger", None)
+        return ledger if isinstance(ledger, DeliveryLedger) else None
+
+    def begin_passive(self, event: AstrMessageEvent) -> DeliveryLedger:
+        ledger = self._event_ledger(event)
+        if ledger is None:
+            ledger = DeliveryLedger(
+                umo=str(getattr(event, "unified_msg_origin", "") or ""),
+                event=event,
+                passive=True,
+            )
+            setattr(event, "_private_companion_delivery_ledger", ledger)
+        if ledger.context_token is None:
+            ledger.context_token = _CURRENT_DELIVERY.set(ledger)
+        setattr(event, "_private_companion_persistence_managed", True)
+        return ledger
+
+    def begin_proactive(self, umo: str) -> DeliveryLedger:
+        ledger = DeliveryLedger(umo=str(umo or "").strip())
+        ledger.context_token = _CURRENT_DELIVERY.set(ledger)
+        return ledger
+
+    @staticmethod
+    def _reset_context(ledger: DeliveryLedger) -> None:
+        token = ledger.context_token
+        ledger.context_token = None
+        if token is None:
+            return
+        try:
+            _CURRENT_DELIVERY.reset(token)
+        except (LookupError, ValueError):
+            pass
+
+    def finish_proactive(self, ledger: DeliveryLedger, outcome: Any) -> Any:
+        self._reset_context(ledger)
+        if not is_dataclass(outcome):
+            return outcome
+        fields = getattr(outcome, "__dataclass_fields__", {})
+        updates: dict[str, Any] = {}
+        if "delivery_umo" in fields:
+            updates["delivery_umo"] = ledger.umo
+        if "delivered_chain" in fields:
+            updates["delivered_chain"] = tuple(ledger.delivered_chain)
+        if "delivered_text" in fields and ledger.confirmed_chains:
+            delivered_text = self._delivered_text(ledger.confirmed_chains)
+            if delivered_text:
+                updates["delivered_text"] = delivered_text
+        return replace(outcome, **updates) if updates else outcome
+
+    def confirm(self, umo: str, chain: list[Any] | tuple[Any, ...]) -> None:
+        components = list(chain or [])
+        if not components:
+            return
+        ledger = _CURRENT_DELIVERY.get()
+        if ledger is None:
+            return
+        if ledger.umo and umo and str(umo) != ledger.umo:
+            return
+        self._append_confirmation(ledger, components)
+
+    def _append_confirmation(
+        self,
+        ledger: DeliveryLedger,
+        components: list[Any],
+    ) -> None:
+        ledger.confirmed_chains.append(components)
+        event = ledger.event
+        # A normal passive turn is finalized by the after-send hook.  Only
+        # schedule the delayed fallback when propagation has already stopped;
+        # otherwise every segmented chunk leaves an unnecessary task behind
+        # that can outlive the turn's event loop.
+        stopped = False
+        if ledger.passive and event is not None:
+            try:
+                stopped = bool(event.is_stopped())
+            except Exception:
+                stopped = False
+        if stopped and ledger.fallback_task is None:
+            try:
+                ledger.fallback_task = asyncio.create_task(
+                    self._finalize_stopped_event_after_yield(ledger)
+                )
+            except RuntimeError:
+                ledger.fallback_task = None
+
+    async def _finalize_stopped_event_after_yield(self, ledger: DeliveryLedger) -> None:
+        await asyncio.sleep(0.05)
+        event = ledger.event
+        if event is None or ledger.finalized:
+            return
+        try:
+            stopped = bool(event.is_stopped())
+        except Exception:
+            stopped = False
+        if stopped:
+            await self.finalize_passive(event)
+
+    def track_background_task(self, task: asyncio.Task | None, label: str) -> None:
+        if task is None or _single_line(label, 100) not in _DELIVERY_TASK_LABELS:
+            return
+        ledger = _CURRENT_DELIVERY.get()
+        if ledger is None or not ledger.passive:
+            return
+        ledger.background_tasks.add(task)
+        task.add_done_callback(ledger.background_tasks.discard)
+
+    def mark_final_response_ready(self, event: AstrMessageEvent) -> None:
+        """Separate tool-step deliveries from the final assistant reply."""
+        ledger = self._event_ledger(event)
+        if ledger is None or ledger.final_chain_start is not None:
+            return
+        if (
+            getattr(event, "_private_companion_official_assistant_message", None)
+            is None
+        ):
+            return
+        ledger.final_chain_start = len(ledger.confirmed_chains)
+
+    def install_send_tracking(self, event: AstrMessageEvent) -> None:
+        if not bool(getattr(event, "_private_companion_persistence_managed", False)):
+            return
+        ledger = self._event_ledger(event) or self.begin_passive(event)
+        try:
+            result = event.get_result()
+        except Exception:
+            result = None
+        chain = list(getattr(result, "chain", []) or []) if result is not None else []
+        if chain:
+            ledger.candidate_chain = chain
+            setattr(event, "_private_companion_final_outbound_chain", tuple(chain))
+        if not callable(ledger.original_send):
+            original_send = getattr(event, "send", None)
+            if callable(original_send):
+                async def tracked_send(message: Any, *args: Any, **kwargs: Any):
+                    send_result = await original_send(message, *args, **kwargs)
+                    if send_result is not False:
+                        sent_chain = getattr(message, "chain", None)
+                        if isinstance(sent_chain, (list, tuple)) and sent_chain:
+                            self._append_confirmation(ledger, list(sent_chain))
+                    return send_result
+
+                ledger.original_send = original_send
+                setattr(event, "_private_companion_original_send", original_send)
+                event.send = tracked_send
+
+        if not callable(ledger.original_send_streaming):
+            original_streaming = getattr(event, "send_streaming", None)
+            if callable(original_streaming):
+                async def tracked_send_streaming(
+                    generator: Any,
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> Any:
+                    captured: list[list[Any]] = []
+
+                    async def capture_generator():
+                        async for message in generator:
+                            sent_chain = getattr(message, "chain", None)
+                            if isinstance(sent_chain, (list, tuple)) and sent_chain:
+                                captured.append(list(sent_chain))
+                            yield message
+
+                    send_result = await original_streaming(
+                        capture_generator(),
+                        *args,
+                        **kwargs,
+                    )
+                    if send_result is not False and captured:
+                        ledger.streaming = True
+                        for sent_chain in captured:
+                            self._append_confirmation(ledger, sent_chain)
+                    return send_result
+
+                ledger.original_send_streaming = original_streaming
+                event.send_streaming = tracked_send_streaming
+
+        setattr(
+            event,
+            "_private_companion_confirmed_send_chains",
+            ledger.confirmed_chains,
+        )
+        setattr(event, "_private_companion_send_tracking_installed", True)
+
+    async def finalize_passive(self, event: AstrMessageEvent) -> bool:
+        ledger = self._event_ledger(event)
+        if ledger is None:
+            return False
+        async with ledger.finalize_lock:
+            if ledger.finalized:
+                return True
+            # A tool-calling turn streams intermediate assistant text before
+            # the agent finishes. That intermediate send must not be treated
+            # as the final reply: on_agent_done has not run yet, so there is
+            # no official assistant message to stage, and finalising here
+            # would lock the ledger before the real reply arrives. The real
+            # reply's _no_save flag would then never be cleared and the core
+            # would drop it from history. Wait for the final reply's own
+            # after_message_sent instead. A stopped event is the exception:
+            # no final reply is coming, so this send IS the reply (the
+            # direct-send-and-stop path).
+            if ledger.final_chain_start is None:
+                try:
+                    stopped = bool(event.is_stopped())
+                except Exception:
+                    stopped = False
+                if not stopped:
+                    return False
+            current = asyncio.current_task()
+            pending = [
+                task
+                for task in list(ledger.background_tasks)
+                if task is not current and not task.done()
+            ]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            if callable(ledger.original_send):
+                event.send = ledger.original_send
+            if callable(ledger.original_send_streaming):
+                event.send_streaming = ledger.original_send_streaming
+            setattr(event, "_private_companion_send_tracking_installed", False)
+            self._reset_context(ledger)
+
+            if (
+                not callable(ledger.original_send)
+                and not callable(ledger.original_send_streaming)
+                and bool(getattr(event, "_has_send_oper", False))
+                and ledger.candidate_chain
+            ):
+                if not any(
+                    sent_chain == ledger.candidate_chain
+                    for sent_chain in ledger.confirmed_chains
+                ):
+                    ledger.confirmed_chains.insert(0, list(ledger.candidate_chain))
+            confirmed_chains = ledger.confirmed_chains
+            if ledger.final_chain_start is not None:
+                confirmed_chains = confirmed_chains[ledger.final_chain_start :]
+            if not confirmed_chains:
+                return False
+            delivered_text = self._delivered_text(
+                confirmed_chains,
+                separator="" if ledger.streaming else "\n",
+            )
+            written = await self.owner._finalize_passive_delivered_response(
+                event,
+                chain=[
+                    component
+                    for sent_chain in confirmed_chains
+                    for component in sent_chain
+                ],
+                fallback_text=delivered_text,
+                force=True,
+            )
+            ledger.finalized = True
+            return bool(written)
+
+    def _delivered_text(
+        self,
+        chains: list[list[Any]],
+        *,
+        separator: str = "\n",
+    ) -> str:
+        extractor = getattr(self.owner, "_actual_text_from_delivered_chain", None)
+        if not callable(extractor):
+            return ""
+        return separator.join(
+            text
+            for chain in chains
+            for text in [extractor(chain)]
+            if text
+        ).strip()
+
+
+def collect_proactive_delivery(
+    function: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
+    """Attach the chains confirmed by the common proactive send primitive."""
+
+    @wraps(function)
+    async def wrapped(self: Any, umo: str, *args: Any, **kwargs: Any) -> Any:
+        coordinator = self._final_response_persistence_coordinator()
+        ledger = coordinator.begin_proactive(umo)
+        try:
+            outcome = await function(self, umo, *args, **kwargs)
+        except BaseException:
+            coordinator._reset_context(ledger)
+            raise
+        return coordinator.finish_proactive(ledger, outcome)
+
+    return wrapped
+
+
+class FinalResponsePersistenceMixin:
+    """Stable integration surface used by PrivateCompanion's thin hooks."""
+
+    def _final_response_persistence_coordinator(
+        self,
+    ) -> FinalResponsePersistenceCoordinator:
+        coordinator = getattr(self, "_final_response_persistence", None)
+        if not isinstance(coordinator, FinalResponsePersistenceCoordinator):
+            coordinator = FinalResponsePersistenceCoordinator(self)
+            self._final_response_persistence = coordinator
+        return coordinator
+
+    def _begin_final_response_persistence(self, event: AstrMessageEvent) -> None:
+        self._final_response_persistence_coordinator().begin_passive(event)
+        self._capture_final_outbound_delivery(event)
+        self._defer_livingmemory_response_capture(event)
+
+    async def _prepare_final_response_after_agent(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: Any,
+    ) -> None:
+        if not bool(getattr(event, "_private_companion_persistence_managed", False)):
+            return
+        try:
+            self._prepare_final_response_persistence(event, run_context, response)
+            self._final_response_persistence_coordinator().mark_final_response_ready(
+                event
+            )
+        finally:
+            self._restore_livingmemory_response_capture(event)
+
+    def _capture_final_outbound_delivery(self, event: AstrMessageEvent) -> None:
+        self._final_response_persistence_coordinator().install_send_tracking(event)
+
+    async def _persist_final_outbound_delivery(self, event: AstrMessageEvent) -> bool:
+        return await self._final_response_persistence_coordinator().finalize_passive(
+            event
+        )
+
+    def _track_final_response_background_task(
+        self,
+        task: asyncio.Task | None,
+        label: str,
+    ) -> None:
+        self._final_response_persistence_coordinator().track_background_task(
+            task,
+            label,
+        )
+
+    def _confirm_outbound_delivery(
+        self,
+        umo: str,
+        chain: list[Any] | tuple[Any, ...],
+    ) -> None:
+        self._final_response_persistence_coordinator().confirm(umo, chain)
+
+    @staticmethod
+    def _actual_text_from_delivered_chain(
+        chain: list[Any] | tuple[Any, ...],
+    ) -> str:
+        text_parts: list[str] = []
+        voice_parts: list[str] = []
+        for component in list(chain or []):
+            if isinstance(component, Plain):
+                text = str(getattr(component, "text", "") or "")
+                if text.strip():
+                    text_parts.append(text)
+                continue
+            if isinstance(component, Record):
+                source_text = str(
+                    getattr(component, "_private_companion_tts_source_text", "")
+                    or getattr(component, "_private_companion_tts_spoken_text", "")
+                    or ""
+                ).strip()
+                if source_text:
+                    voice_parts.append(source_text)
+        return "".join(text_parts or voice_parts).strip()
+
+    @staticmethod
+    def _is_livingmemory_handler_module(module_path: Any) -> bool:
+        normalized = str(module_path or "").strip().lower().replace("-", "_")
+        return "astrbot_plugin_livingmemory" in normalized
+
+    @staticmethod
+    def _is_memory_companion_handler_module(module_path: Any) -> bool:
+        normalized = str(module_path or "").strip().lower().replace("-", "_")
+        return any(
+            plugin_id in normalized
+            for plugin_id in (
+                "astrbot_plugin_memory_companion",
+                "astrbot_plugin_remember_you",
+            )
+        )
+
+    def _livingmemory_response_handlers(
+        self,
+        *,
+        plugins_name: list[str] | None = None,
+    ) -> list[Any]:
+        if not bool(getattr(self, "enable_livingmemory_integration", False)):
+            return []
+        try:
+            handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.OnLLMResponseEvent,
+                plugins_name=plugins_name,
+            )
+        except Exception:
+            return []
+        return [
+            handler
+            for handler in handlers
+            if self._is_livingmemory_handler_module(
+                getattr(handler, "handler_module_path", "")
+            )
+        ]
+
+    def _memory_companion_response_handlers(
+        self,
+        *,
+        plugins_name: list[str] | None = None,
+    ) -> list[Any]:
+        if not bool(getattr(self, "enable_livingmemory_integration", False)):
+            return []
+        bridge_getter = getattr(self, "_memory_companion_bridge", None)
+        try:
+            bridge = bridge_getter() if callable(bridge_getter) else None
+        except Exception:
+            return []
+        if not callable(getattr(bridge, "record_visible_turn", None)):
+            return []
+        try:
+            handlers = star_handlers_registry.get_handlers_by_event_type(
+                EventType.OnLLMResponseEvent,
+                plugins_name=plugins_name,
+            )
+        except Exception:
+            return []
+        return [
+            handler
+            for handler in handlers
+            if self._is_memory_companion_handler_module(
+                getattr(handler, "handler_module_path", "")
+            )
+        ]
+
+    @staticmethod
+    def _handler_plugin_name(handler: Any) -> str:
+        plugin = star_map.get(str(getattr(handler, "handler_module_path", "") or ""))
+        return str(getattr(plugin, "name", "") or "").strip()
+
+    def _defer_livingmemory_response_capture(self, event: AstrMessageEvent) -> bool:
+        """Keep recall enabled while postponing raw assistant writes."""
+        if event is None or bool(
+            getattr(event, "_private_companion_final_memory_dispatch", False)
+        ):
+            return False
+        if bool(getattr(event, "_private_companion_livingmemory_deferred", False)):
+            return True
+
+        original_plugins = getattr(event, "plugins_name", None)
+        livingmemory_handlers = self._livingmemory_response_handlers(
+            plugins_name=original_plugins
+        )
+        memory_companion_handlers = self._memory_companion_response_handlers(
+            plugins_name=original_plugins
+        )
+        livingmemory_names = {
+            name
+            for name in (
+                self._handler_plugin_name(handler)
+                for handler in livingmemory_handlers
+            )
+            if name
+        }
+        memory_companion_names = {
+            name
+            for name in (
+                self._handler_plugin_name(handler)
+                for handler in memory_companion_handlers
+            )
+            if name
+        }
+        managed_names = livingmemory_names | memory_companion_names
+        if not managed_names:
+            return False
+
+        if original_plugins is None or original_plugins == ["*"]:
+            allowed_plugins = sorted(
+                {
+                    str(getattr(plugin, "name", "") or "").strip()
+                    for plugin in star_map.values()
+                    if bool(getattr(plugin, "activated", False))
+                    and str(getattr(plugin, "name", "") or "").strip()
+                    not in managed_names
+                }
+            )
+        else:
+            allowed_plugins = [
+                str(name)
+                for name in list(original_plugins or [])
+                if str(name) not in managed_names
+            ]
+
+        setattr(event, "_private_companion_original_plugins_name", original_plugins)
+        setattr(
+            event,
+            "_private_companion_livingmemory_plugin_names",
+            tuple(sorted(livingmemory_names)),
+        )
+        setattr(
+            event,
+            "_private_companion_memory_companion_plugin_names",
+            tuple(sorted(memory_companion_names)),
+        )
+        setattr(event, "_private_companion_livingmemory_deferred", True)
+        event.plugins_name = allowed_plugins
+        return True
+
+    @staticmethod
+    def _restore_livingmemory_response_capture(event: AstrMessageEvent) -> None:
+        if event is None or not bool(
+            getattr(event, "_private_companion_livingmemory_deferred", False)
+        ):
+            return
+        event.plugins_name = getattr(
+            event,
+            "_private_companion_original_plugins_name",
+            None,
+        )
+        setattr(event, "_private_companion_livingmemory_deferred", False)
+
+    @staticmethod
+    def _message_content_text(message: Any) -> str:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        return "".join(
+            str(getattr(part, "text", "") or "")
+            for part in content
+            if isinstance(part, TextPart)
+        ).strip()
+
+    @staticmethod
+    def _event_uses_streaming_result(event: AstrMessageEvent) -> bool:
+        try:
+            result = event.get_result()
+        except Exception:
+            return False
+        content_type = getattr(result, "result_content_type", None)
+        label = str(getattr(content_type, "name", "") or content_type or "").upper()
+        return "STREAMING" in label
+
+    def _last_assistant_text(self, run_context: Any) -> str:
+        messages = getattr(run_context, "messages", None)
+        if not isinstance(messages, list):
+            return ""
+        for message in reversed(messages):
+            if str(getattr(message, "role", "") or "") == "assistant":
+                return self._message_content_text(message)
+        return ""
+
+    def _prepare_final_response_persistence(
+        self,
+        event: AstrMessageEvent,
+        run_context: Any,
+        response: Any,
+    ) -> None:
+        if event is None or not bool(
+            getattr(event, "_private_companion_persistence_managed", False)
+        ):
+            return
+        messages = getattr(run_context, "messages", None)
+        if not isinstance(messages, list):
+            return
+        for message in reversed(messages):
+            if str(getattr(message, "role", "") or "") != "assistant":
+                continue
+            setattr(
+                event,
+                "_private_companion_raw_assistant_text",
+                self._message_content_text(message),
+            )
+            setattr(event, "_private_companion_official_assistant_message", message)
+            try:
+                message._no_save = True
+            except Exception:
+                pass
+            break
+
+        setattr(
+            event,
+            "_private_companion_reviewed_assistant_text",
+            str(getattr(response, "completion_text", "") or "").strip(),
+        )
+        try:
+            request = event.get_extra("provider_request")
+            conversation = getattr(request, "conversation", None)
+            conversation_id = str(getattr(conversation, "cid", "") or "").strip()
+            if conversation_id:
+                setattr(
+                    event,
+                    "_private_companion_response_conversation_id",
+                    conversation_id,
+                )
+        except Exception:
+            pass
+
+    def _delivered_assistant_text_from_chain(
+        self,
+        chain: list[Any] | tuple[Any, ...],
+        *,
+        fallback_text: str = "",
+    ) -> str:
+        components = list(chain or [])
+        text = str(fallback_text or "").strip()
+        if not text:
+            text = self._actual_text_from_delivered_chain(components)
+        image_count = sum(isinstance(component, Image) for component in components)
+        record_count = sum(isinstance(component, Record) for component in components)
+        media_marker = _format_history_media_marker(
+            images=image_count,
+            records=record_count,
+        )
+        if media_marker:
+            text = f"{text}\n{media_marker}" if text else media_marker
+        return text.strip()
+
+    def _stage_delivered_assistant_for_official_history(
+        self,
+        *,
+        event: AstrMessageEvent,
+        assistant_response: str,
+    ) -> bool:
+        response_text = str(assistant_response or "").strip()
+        message = getattr(event, "_private_companion_official_assistant_message", None)
+        if (
+            not response_text
+            or message is None
+            or str(getattr(message, "role", "") or "") != "assistant"
+        ):
+            return False
+        try:
+            message.content = [TextPart(text=response_text)]
+            if hasattr(message, "tool_calls"):
+                message.tool_calls = None
+            if hasattr(message, "tool_call_id"):
+                message.tool_call_id = None
+            message._no_save = False
+        except Exception as exc:
+            logger.warning(
+                "[PrivateCompanion] 实际回复暂存到 AstrBot 会话上下文失败: session=%s error=%s",
+                _single_line(getattr(event, "unified_msg_origin", ""), 140),
+                _single_line(exc, 160),
+            )
+            return False
+        logger.info(
+            "[PrivateCompanion] 已将实际发送回复交给 AstrBot 核心保存: %s",
+            _single_line(getattr(event, "unified_msg_origin", ""), 140),
+        )
+        return True
+
+    async def _append_delivered_assistant_to_conversation(
+        self,
+        *,
+        event: AstrMessageEvent,
+        assistant_response: str,
+    ) -> bool:
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        response_text = str(assistant_response or "").strip()
+        conv_mgr = getattr(getattr(self, "context", None), "conversation_manager", None)
+        if not umo or not response_text or conv_mgr is None:
+            return False
+        requested_cid = str(
+            getattr(event, "_private_companion_response_conversation_id", "") or ""
+        ).strip()
+
+        async def write() -> bool:
+            conv_id = requested_cid or str(
+                await conv_mgr.get_curr_conversation_id(umo) or ""
+            ).strip()
+            if not conv_id:
+                return False
+            conversation = await conv_mgr.get_conversation(umo, conv_id)
+            if conversation is None:
+                return False
+            raw_history = getattr(conversation, "history", "[]")
+            history = (
+                json.loads(raw_history or "[]")
+                if isinstance(raw_history, str)
+                else list(raw_history)
+                if isinstance(raw_history, list)
+                else []
+            )
+            history.append(AssistantMessageSegment(content=response_text).model_dump())
+            await conv_mgr.update_conversation(umo, conv_id, history=history)
+            return True
+
+        try:
+            written = bool(
+                await self._conversation_db_operation(
+                    "append_delivered_assistant",
+                    write,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PrivateCompanion] 实际回复写入 AstrBot 会话历史失败: session=%s error=%s",
+                _single_line(umo, 140),
+                _single_line(exc, 160),
+            )
+            return False
+        if written:
+            logger.info(
+                "[PrivateCompanion] 已将实际发送回复写入 AstrBot 会话历史: %s",
+                _single_line(umo, 140),
+            )
+        return written
+
+    async def _record_final_assistant_in_livingmemory(
+        self,
+        *,
+        umo: str,
+        assistant_response: str,
+        delivery_id: str,
+        event: AstrMessageEvent | None = None,
+    ) -> bool:
+        response_text = str(assistant_response or "").strip()
+        umo = str(umo or "").strip()
+        if not umo or not response_text:
+            return False
+
+        handlers = self._livingmemory_response_handlers()
+        if event is not None and bool(
+            getattr(event, "_private_companion_persistence_managed", False)
+        ):
+            selected_names = set(
+                getattr(event, "_private_companion_livingmemory_plugin_names", ()) or ()
+            )
+            if not selected_names:
+                return False
+            handlers = [
+                handler
+                for handler in handlers
+                if self._handler_plugin_name(handler) in selected_names
+            ]
+        if not handlers:
+            return False
+
+        dedup_key = str(delivery_id or "").strip() or hashlib.sha1(
+            f"{umo}\0{response_text}".encode("utf-8", errors="ignore")
+        ).hexdigest()
+        recorded = getattr(self, "_livingmemory_final_delivery_ids", None)
+        if not isinstance(recorded, dict):
+            recorded = {}
+            self._livingmemory_final_delivery_ids = recorded
+        if dedup_key in recorded:
+            return True
+
+        dispatch_event = event or self._proactive_synthetic_event(
+            umo,
+            prompt="",
+            name=str(getattr(self, "bot_name", "") or "PrivateCompanion"),
+        )
+        if dispatch_event is None:
+            return False
+        setattr(dispatch_event, "_private_companion_final_memory_dispatch", True)
+        response = LLMResponse(role="assistant", completion_text=response_text)
+        delivered = False
+        invoked_plugins: set[int] = set()
+        for handler in handlers:
+            plugin_metadata = star_map.get(
+                str(getattr(handler, "handler_module_path", "") or "")
+            )
+            plugin_instance = getattr(plugin_metadata, "star_cls", None)
+            direct_handler = getattr(plugin_instance, "handle_memory_reflection", None)
+            try:
+                if callable(direct_handler) and id(plugin_instance) not in invoked_plugins:
+                    await direct_handler(dispatch_event, response)
+                    invoked_plugins.add(id(plugin_instance))
+                elif not callable(direct_handler):
+                    await handler.handler(dispatch_event, response)
+                else:
+                    continue
+                delivered = True
+            except Exception as exc:
+                logger.warning(
+                    "[PrivateCompanion] LivingMemory 最终回复写入失败: session=%s handler=%s error=%s",
+                    _single_line(umo, 140),
+                    _single_line(getattr(handler, "handler_name", ""), 80),
+                    _single_line(exc, 160),
+                )
+        if delivered:
+            recorded[dedup_key] = _now_ts()
+            if len(recorded) > 512:
+                for old_key, _ in sorted(
+                    recorded.items(), key=lambda item: item[1]
+                )[:-384]:
+                    recorded.pop(old_key, None)
+            logger.info(
+                "[PrivateCompanion] 已将实际发送回复交给 LivingMemory 记录: %s",
+                _single_line(umo, 140),
+            )
+        return delivered
+
+    async def _memory_companion_record_confirmed_assistant_message(
+        self,
+        event: Any,
+        *,
+        content: str,
+        delivery_id: str = "",
+    ) -> bool:
+        response_text = str(content or "").strip()[:2000]
+        session_id = _single_line(getattr(event, "unified_msg_origin", ""), 200)
+        if not response_text or not session_id:
+            return False
+        bridge = self._memory_companion_bridge()
+        recorder = getattr(bridge, "record_visible_turn", None) if bridge else None
+        if not callable(recorder):
+            return False
+        try:
+            private_chat = bool(getattr(event, "is_private_chat", lambda: False)())
+        except Exception:
+            private_chat = False
+        try:
+            user_id = _single_line(event.get_sender_id(), 80)
+        except Exception:
+            user_id = ""
+        try:
+            user_name = _single_line(self._sender_display_name(event), 80)
+        except Exception:
+            user_name = user_id
+        try:
+            await recorder(
+                role="assistant",
+                content=response_text,
+                scope="private" if private_chat else "group",
+                session_id=session_id,
+                platform=session_id.split(":", 1)[0] if ":" in session_id else "",
+                user_id=user_id,
+                user_name=user_name,
+                message_id=(
+                    "private_companion_delivered_"
+                    f"{_single_line(delivery_id, 120) or uuid.uuid4().hex}"
+                ),
+                source="private_companion_confirmed_reply",
+                metadata={
+                    "clean_visible_text": response_text,
+                    "delivery_confirmed": True,
+                    "conversation_turn": "passive_reply",
+                },
+            )
+            return True
+        except Exception as exc:
+            optional_failed = getattr(
+                self, "_memory_companion_optional_dependency_failed", None
+            )
+            if callable(optional_failed) and optional_failed(
+                exc, where="record_confirmed_assistant_message"
+            ):
+                return False
+            logger.debug(
+                "[PrivateCompanion] MemoryCompanion 实际回复写入失败: %s",
+                _single_line(exc, 120),
+            )
+            return False
+
+    async def _finalize_passive_delivered_response(
+        self,
+        event: AstrMessageEvent,
+        *,
+        chain: list[Any] | tuple[Any, ...] | None = None,
+        fallback_text: str = "",
+        force: bool = False,
+    ) -> bool:
+        if event is None or not bool(
+            getattr(event, "_private_companion_persistence_managed", False)
+        ):
+            return False
+        if bool(getattr(event, "private_companion_proactive_framework", False)) and str(
+            getattr(event, "_private_companion_external_proactive_source", "") or ""
+        ) != "proactive_chat":
+            return False
+        if bool(getattr(event, "_private_companion_delivery_persisted", False)):
+            return True
+        if not force and not bool(getattr(event, "_has_send_oper", False)):
+            return False
+
+        delivered_chain = list(
+            chain
+            if chain is not None
+            else getattr(event, "_private_companion_final_outbound_chain", ())
+        )
+        response_text = self._delivered_assistant_text_from_chain(
+            delivered_chain,
+            fallback_text=fallback_text,
+        )
+        if not response_text:
+            return False
+
+        official_written = self._stage_delivered_assistant_for_official_history(
+            event=event,
+            assistant_response=response_text,
+        )
+        if not official_written:
+            official_written = await self._append_delivered_assistant_to_conversation(
+                event=event,
+                assistant_response=response_text,
+            )
+        delivery_id = str(
+            getattr(event, "_private_companion_delivery_id", "")
+            or self._event_message_id(event)
+            or f"passive:{id(event)}"
+        )
+        memory_written = await self._record_final_assistant_in_livingmemory(
+            umo=str(getattr(event, "unified_msg_origin", "") or ""),
+            assistant_response=response_text,
+            delivery_id=delivery_id,
+            event=event,
+        )
+        memory_companion_written = False
+        if bool(
+            getattr(event, "_private_companion_memory_companion_plugin_names", ())
+        ):
+            memory_companion_written = bool(
+                await self._memory_companion_record_confirmed_assistant_message(
+                    event,
+                    content=response_text,
+                    delivery_id=delivery_id,
+                )
+            )
+        if official_written or memory_written or memory_companion_written:
+            setattr(event, "_private_companion_delivery_persisted", True)
+        return official_written or memory_written or memory_companion_written

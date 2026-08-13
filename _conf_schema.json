@@ -1,0 +1,258 @@
+{
+  "enabled": {
+    "description": "启用独立生图服务",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅停用生图能力，主陪伴插件的普通聊天与其他陪伴功能不受影响。"
+  },
+  "migration": {
+    "description": "迁移兼容",
+    "type": "object",
+    "items": {
+      "reuse_private_companion_settings": {
+        "description": "复用旧陪伴插件生图设置",
+        "type": "bool",
+        "default": true,
+        "hint": "未在本插件填写的生图设置将继续读取旧插件，更新后无需重新填写密钥。"
+      },
+      "reuse_private_companion_assets": {
+        "description": "复用旧陪伴插件图库与归档",
+        "type": "bool",
+        "default": true,
+        "hint": "保留既有基础人设图、场景图库、今日穿搭图和生成记录。"
+      }
+    }
+  },
+  "image": {
+    "description": "图像生成",
+    "type": "object",
+    "items": {
+      "photo_generation_backend": {
+        "description": "生图后端",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "external", "comfyui", "sdgen", "tool_call"]
+      },
+      "external_image_api_platform": {
+        "description": "在线图片平台",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "openai", "openrouter", "minimax", "bailian", "modelscope", "doubao", "gemini"]
+      },
+      "external_image_api_base_url": {
+        "description": "在线图片 API 地址",
+        "type": "string",
+        "default": ""
+      },
+      "external_image_api_key": {
+        "description": "在线图片 API Key",
+        "type": "string",
+        "default": "",
+        "secret": true
+      },
+      "external_image_api_model": {
+        "description": "在线图片模型",
+        "type": "string",
+        "default": ""
+      },
+      "external_image_api_size": {
+        "description": "默认图片尺寸",
+        "type": "string",
+        "default": "1024x1024"
+      },
+      "external_image_api_timeout_seconds": {
+        "description": "在线生图超时秒数",
+        "type": "int",
+        "default": 180
+      },
+      "external_image_api_custom_headers": {
+        "description": "在线图片 API 自定义请求头",
+        "type": "text",
+        "default": ""
+      },
+      "external_image_api_endpoints": {
+        "description": "在线图片 API 优先级队列",
+        "type": "list",
+        "default": []
+      },
+      "enable_backup_external_image_api": {
+        "description": "启用备选在线图片 API",
+        "type": "bool",
+        "default": false
+      },
+      "backup_external_image_api_platform": {
+        "description": "备选在线图片平台",
+        "type": "string",
+        "default": "auto"
+      },
+      "backup_external_image_api_base_url": {
+        "description": "备选在线图片 API 地址",
+        "type": "string",
+        "default": ""
+      },
+      "backup_external_image_api_key": {
+        "description": "备选在线图片 API Key",
+        "type": "string",
+        "default": "",
+        "secret": true
+      },
+      "backup_external_image_api_model": {
+        "description": "备选在线图片模型",
+        "type": "string",
+        "default": ""
+      },
+      "comfyui_text2img_workflow_name": {
+        "description": "ComfyUI 文生图工作流",
+        "type": "string",
+        "default": ""
+      },
+      "comfyui_selfie_workflow_name": {
+        "description": "ComfyUI 自拍与改图工作流",
+        "type": "string",
+        "default": ""
+      },
+      "comfyui_photo_wait_seconds": {
+        "description": "ComfyUI 等待秒数",
+        "type": "int",
+        "default": 90
+      },
+      "custom_photo_tool_name": {
+        "description": "自定义生图函数工具名",
+        "type": "string",
+        "default": ""
+      },
+      "custom_photo_tool_prompt_param": {
+        "description": "自定义工具提示词参数名",
+        "type": "string",
+        "default": "prompt"
+      },
+      "custom_photo_tool_kind_param": {
+        "description": "自定义工具类型参数名",
+        "type": "string",
+        "default": ""
+      },
+      "custom_photo_tool_reference_param": {
+        "description": "自定义工具参考图参数名",
+        "type": "string",
+        "default": ""
+      },
+      "enable_photo_reference_image": {
+        "description": "启用人设与穿搭参考图",
+        "type": "bool",
+        "default": false
+      },
+      "photo_persona_reference_image_path": {
+        "description": "人设参考图路径或 URL",
+        "type": "string",
+        "default": ""
+      },
+      "photo_reference_library": {
+        "description": "参考图库",
+        "type": "list",
+        "default": []
+      },
+      "photo_reference_catalog": {
+        "description": "结构化参考图库",
+        "type": "list",
+        "default": []
+      },
+      "photo_generation_prompt_format": {
+        "description": "提示词格式",
+        "type": "string",
+        "default": "traditional",
+        "options": ["traditional", "natural_language", "nai"]
+      },
+      "photo_generation_style": {
+        "description": "默认生图风格",
+        "type": "string",
+        "default": "真实"
+      },
+      "photo_generation_style_custom_prompt": {
+        "description": "自定义风格提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_negative_prompt_mode": {
+        "description": "负面提示词策略",
+        "type": "string",
+        "default": "safe_default",
+        "options": ["safe_default", "merge", "replace"]
+      },
+      "photo_generation_negative_prompt": {
+        "description": "全局自定义负面提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_text2img_negative_prompt": {
+        "description": "文生图负面提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_selfie_negative_prompt": {
+        "description": "自拍负面提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_edit_negative_prompt": {
+        "description": "改图负面提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_fixed_prompt": {
+        "description": "全局固定附加提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_text2img_fixed_prompt": {
+        "description": "文生图固定附加提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_selfie_fixed_prompt": {
+        "description": "自拍固定附加提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_edit_fixed_prompt": {
+        "description": "改图固定附加提示词",
+        "type": "text",
+        "default": ""
+      },
+      "photo_generation_scene_presets": {
+        "description": "场景预设",
+        "type": "text",
+        "default": ""
+      },
+      "enable_generated_photo_cleanup": {
+        "description": "自动清理生图归档",
+        "type": "bool",
+        "default": true
+      },
+      "generated_photo_retention_days": {
+        "description": "生图归档保留天数",
+        "type": "int",
+        "default": 30
+      },
+      "generated_photo_max_mb": {
+        "description": "生图归档磁盘上限 MB",
+        "type": "int",
+        "default": 512
+      },
+      "enable_local_photo_load_guard": {
+        "description": "本地生图负载保护",
+        "type": "bool",
+        "default": true
+      },
+      "local_photo_cpu_busy_percent": {
+        "description": "本地生图 CPU 延后阈值",
+        "type": "int",
+        "default": 85
+      },
+      "local_photo_memory_busy_percent": {
+        "description": "本地生图内存延后阈值",
+        "type": "int",
+        "default": 88
+      }
+    }
+  }
+}
