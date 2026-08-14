@@ -12312,13 +12312,9 @@ Output:
                     reference_plan,
                     submitted_reference_ids=effective_submitted_reference_ids,
                 )
-            if (
-                effective_reference_fallback.message
-                and effective_reference_fallback.message not in str(note or "")
-            ):
-                note = (
-                    f"{_single_line(note, 260)}；{effective_reference_fallback.message}"
-                ).strip("；")
+            # Reference-role fallback is diagnostic metadata, not user-facing
+            # generation copy. Keep it in the generation record below without
+            # leaking orchestration details through the returned backend note.
             output_exists = False
             if image_path:
                 try:
