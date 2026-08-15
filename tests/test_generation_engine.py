@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from generation_contracts import (  # noqa: E402
+    BackendCapabilitiesV1,
+    CharacterIdentitySpecV1,
+    CompositionSpecV1,
+    GenerationResultV1,
+    GenerationSpecV1,
+    ReferenceBindingV1,
+    SceneContextV1,
+    WardrobeSpecV1,
+    WeatherFactsV1,
+    thermal_level_for_temperature,
+)
+from generation_engine import (  # noqa: E402
+    GenerationEngine,
+    RouteDefinition,
+    RouteKey,
+    RouteRegistry,
+    ReferencePlanner,
+    route_cache_key,
+)
+from generation_adapters import LegacyCallbackAdapter  # noqa: E402
+from generation_profiles import AnimaPromptCompiler, default_model_profile_registry  # noqa: E402
+
+
+def _spec(*, request_id: str = "r1") -> GenerationSpecV1:
+    return GenerationSpecV1(
+        schema_version=1,
+        request_id=request_id,
+        operation="selfie",
+        user_request="来张自拍",
+        scene=SceneContextV1(
+            captured_at="2026-08-15T00:08:00+08:00",
+            local_time="00:08",
+            time_phase="late_night",
+            location_text="bedroom",
+            location_type="bedroom",
+            indoor=True,
+            current_activity="preparing for sleep",
+            sleep_phase="preparing_for_sleep",
+            weather=WeatherFactsV1(temperature_c=30, feels_like_c=32),
+        ),
+        character=CharacterIdentitySpecV1(
+            name="小爱",
+            appearance=("long pink hair", "golden eyes"),
+            default_style="anime illustration",
+        ),
+        wardrobe=WardrobeSpecV1(
+            category="sleepwear",
+            required=("lightweight summer pajamas",),
+            forbidden=("wool sweater", "thick jacket"),
+            thermal_level="hot",
+        ),
+        references=(
+            ReferenceBindingV1("identity", "/tmp/identity.png", roles=("identity",), priority=10),
+        ),
+        composition=CompositionSpecV1(
+            shot="upper body selfie", location="bedroom", lighting="warm bedside light"
+        ),
+    )
+
+
+class _Adapter:
+    def __init__(self, backend: str, *, fail: bool = False, max_refs: int = 1) -> None:
+        self.backend = backend
+        self.fail = fail
+        self.max_refs = max_refs
+        self.prompts = []
+
+    async def capabilities(self, route):
+        return BackendCapabilitiesV1(
+            negative_prompt=True,
+            max_reference_images=self.max_refs,
+            reference_roles=("identity", "outfit"),
+        )
+
+    async def generate(self, route, spec, prompt, references, trace):
+        self.prompts.append(prompt)
+        if self.fail:
+            return GenerationResultV1(
+                request_id=spec.request_id,
+                backend=self.backend,
+                model_profile=prompt.model_profile,
+                error_code="submission_failed",
+            )
+        return GenerationResultV1(
+            request_id=spec.request_id,
+            task_id="task",
+            backend=self.backend,
+            model_profile=prompt.model_profile,
+            workflow=route.key.workflow,
+            image_path="/tmp/result.png",
+            submitted_reference_ids=tuple(item.reference_id for item in references.submitted),
+            generation_completed=True,
+            trace=tuple(trace),
+        )
+
+
+class _TimeoutAdapter(_Adapter):
+    async def generate(self, route, spec, prompt, references, trace):
+        raise TimeoutError("injected timeout")
+
+
+class ContractAndCompilerTests(unittest.TestCase):
+    def test_reference_planner_preserves_subjects_and_reports_capacity_degradation(self):
+        references = (
+            ReferenceBindingV1("bot", "/tmp/bot.png", roles=("identity",), subject="bot", priority=10),
+            ReferenceBindingV1("friend", "/tmp/friend.png", roles=("relationship_role",), subject="friend", priority=9),
+        )
+        plan = ReferencePlanner().plan(
+            references,
+            BackendCapabilitiesV1(max_reference_images=1, reference_roles=("identity", "relationship_role")),
+        )
+        self.assertEqual(("bot",), tuple(item.subject for item in plan.submitted))
+        self.assertEqual(("friend",), tuple(item.subject for item in plan.omitted))
+        self.assertIn("references:1/2", plan.degraded_capabilities)
+    def test_temperature_thresholds_use_feels_like(self):
+        self.assertEqual("hot", thermal_level_for_temperature(28))
+        self.assertEqual("warm", thermal_level_for_temperature(27.9))
+        self.assertEqual("mild", thermal_level_for_temperature(13))
+        self.assertEqual("cool", thermal_level_for_temperature(5))
+        self.assertEqual("cold", thermal_level_for_temperature(4.9))
+        self.assertEqual("hot", WeatherFactsV1(temperature_c=20, feels_like_c=31).thermal_level)
+
+    def test_anima_compiler_separates_negative_and_strips_nai_syntax(self):
+        compiled = AnimaPromptCompiler().compile(_spec())
+        self.assertIn("lightweight summer pajamas", compiled.positive_prompt)
+        self.assertIn("wool sweater", compiled.negative_prompt)
+        self.assertNotIn("wool sweater", compiled.positive_prompt)
+        self.assertNotRegex(compiled.positive_prompt, r"\d+(?:\.\d+)?::|[{}\[\]]")
+
+    def test_route_cache_is_isolated_by_profile_and_workflow(self):
+        spec = _spec()
+        first = RouteDefinition("a", RouteKey("comfyui", "anima", "selfie", "wf-a"))
+        second = RouteDefinition("b", RouteKey("comfyui", "nai", "selfie", "wf-a"))
+        third = RouteDefinition("c", RouteKey("comfyui", "anima", "selfie", "wf-b"))
+        self.assertNotEqual(route_cache_key(spec, first), route_cache_key(spec, second))
+        self.assertNotEqual(route_cache_key(spec, first), route_cache_key(spec, third))
+        different_request = replace(spec, user_request="换成礼服")
+        self.assertNotEqual(route_cache_key(spec, first), route_cache_key(different_request, first))
+
+    def test_companion_snapshot_maps_to_versioned_scene(self):
+        scene = SceneContextV1.from_companion_snapshot({
+            "version": 3,
+            "captured_at": "2026-08-15T00:08:00+08:00",
+            "time": "00:08",
+            "daypart": "深夜",
+            "schedule": {"activity": "准备睡觉"},
+            "location": {"text": "卧室", "category": "home"},
+            "weather": {"temperature_c": 33, "feels_like_c": 36, "text": "晴", "source": "qweather"},
+            "sleep": {"phase": "falling_asleep"},
+        })
+        self.assertEqual("hot", scene.weather.thermal_level)
+        self.assertEqual("falling_asleep", scene.sleep_phase)
+        self.assertTrue(scene.indoor)
+
+
+class EngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_cache_can_be_shared_across_request_scoped_engines(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie", "wf")))
+        shared_cache = {}
+        first_adapter = _Adapter("comfyui")
+        await GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": first_adapter}, prompt_cache=shared_cache
+        ).generate(_spec(request_id="first"), "route")
+        self.assertEqual(1, len(shared_cache))
+        second_adapter = _Adapter("comfyui")
+        result = await GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": second_adapter}, prompt_cache=shared_cache
+        ).generate(_spec(request_id="second"), "route")
+        self.assertTrue(result.ok)
+        self.assertEqual(1, len(shared_cache))
+    async def test_legacy_callback_adapter_keeps_unified_contract(self):
+        captured = {}
+
+        async def callback(**kwargs):
+            captured.update(kwargs)
+            return {"image_path": "/tmp/legacy.png", "note": "legacy-ok"}
+
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("legacy", RouteKey("legacy", "legacy", "selfie")))
+        engine = GenerationEngine(
+            default_model_profile_registry(), routes, {"legacy": LegacyCallbackAdapter(callback)}
+        )
+        spec = replace(_spec(), legacy_prompt="legacy positive prompt")
+        result = await engine.generate(spec, "legacy")
+        self.assertTrue(result.ok)
+        self.assertEqual("legacy positive prompt", captured["prompt"].positive_prompt)
+
+    async def test_fallback_replans_references_for_target_capacity(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition(
+            "small", RouteKey("comfyui", "anima", "selfie"),
+            fallback_routes=("large",), allow_paid_fallback=True,
+        ))
+        routes.register(RouteDefinition("large", RouteKey("external", "generic_natural", "selfie"), paid=True))
+        small = _Adapter("comfyui", fail=True, max_refs=1)
+        large = _Adapter("external", max_refs=2)
+        second = ReferenceBindingV1("friend", "/tmp/friend.png", roles=("outfit",), subject="friend", priority=5)
+        spec = replace(_spec(), references=(*_spec().references, second))
+        result = await GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": small, "external": large}
+        ).generate(spec, "small")
+        self.assertTrue(result.ok)
+        self.assertEqual(("identity", "friend"), result.submitted_reference_ids)
+    async def test_fallback_recompiles_for_target_profile(self):
+        routes = RouteRegistry()
+        routes.register(
+            RouteDefinition(
+                "anima-local",
+                RouteKey("comfyui", "anima", "selfie", "anima-selfie"),
+                fallback_routes=("natural-online",),
+                allow_paid_fallback=True,
+            )
+        )
+        routes.register(
+            RouteDefinition(
+                "natural-online",
+                RouteKey("external", "generic_natural", "selfie"),
+                paid=True,
+            )
+        )
+        local = _Adapter("comfyui", fail=True)
+        online = _Adapter("external")
+        engine = GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": local, "external": online}
+        )
+        result = await engine.generate(_spec(), "anima-local")
+        self.assertTrue(result.ok)
+        self.assertEqual("anima", local.prompts[0].model_profile)
+        self.assertEqual("generic_natural", online.prompts[0].model_profile)
+        self.assertNotEqual(local.prompts[0].positive_prompt, online.prompts[0].positive_prompt)
+
+    async def test_paid_fallback_is_not_silent(self):
+        routes = RouteRegistry()
+        routes.register(
+            RouteDefinition(
+                "local", RouteKey("comfyui", "anima", "selfie"),
+                fallback_routes=("paid",), allow_paid_fallback=False,
+            )
+        )
+        routes.register(RouteDefinition("paid", RouteKey("external", "generic_natural", "selfie"), paid=True))
+        local = _Adapter("comfyui", fail=True)
+        paid = _Adapter("external")
+        engine = GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": local, "external": paid}
+        )
+        result = await engine.generate(_spec(), "local")
+        self.assertFalse(result.ok)
+        self.assertEqual([], paid.prompts)
+        self.assertTrue(any(event["stage"] == "fallback_skipped" for event in result.trace))
+
+    async def test_shadow_mode_never_calls_backend(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie")))
+        adapter = _Adapter("comfyui")
+        engine = GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": adapter}, shadow_mode=True
+        )
+        result = await engine.generate(_spec(), "route")
+        self.assertFalse(result.ok)
+        self.assertIn("shadow_mode", result.note)
+        self.assertEqual([], adapter.prompts)
+
+    async def test_output_validation_failure_is_classified(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie")))
+        adapter = _Adapter("comfyui")
+        engine = GenerationEngine(
+            default_model_profile_registry(),
+            routes,
+            {"comfyui": adapter},
+            output_validator=lambda path: (False, "bad image"),
+        )
+        result = await engine.generate(_spec(), "route")
+        self.assertFalse(result.ok)
+        self.assertEqual("output_validation_failed", result.error_code)
+        self.assertEqual("output_validation", result.failure_stage)
+
+    async def test_timeout_fault_injection_and_circuit_isolation(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("bad", RouteKey("comfyui", "anima", "selfie", "bad")))
+        routes.register(RouteDefinition("good", RouteKey("comfyui", "anima", "selfie", "good")))
+        adapter = _TimeoutAdapter("comfyui")
+        engine = GenerationEngine(default_model_profile_registry(), routes, {"comfyui": adapter})
+        for _ in range(3):
+            result = await engine.generate(_spec(), "bad")
+            self.assertEqual("backend_timeout", result.error_code)
+        opened = await engine.generate(_spec(), "bad")
+        self.assertEqual("route_unavailable", opened.error_code)
+        # The breaker key is the route name, so another route remains callable.
+        isolated = await engine.generate(_spec(), "good")
+        self.assertEqual("backend_timeout", isolated.error_code)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -23,6 +23,54 @@
       }
     }
   },
+  "engine": {
+    "description": "统一生图引擎（高级）",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "运行模式",
+        "type": "string",
+        "default": "legacy",
+        "options": ["legacy", "shadow", "active"],
+        "hint": "legacy 保持原链路；shadow 只编译与诊断、不提交；active 才使用新路线。"
+      },
+      "instant_rollback": {
+        "description": "立即回滚到旧链路",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后无论当前模式为何，都只走原有稳定链路。"
+      },
+      "anima_scopes": {
+        "description": "ANIMA 启用范围",
+        "type": "list",
+        "default": ["selfie"],
+        "hint": "可按 text2img、selfie、portrait、edit 逐类放量。"
+      },
+      "routes": {
+        "description": "生图路线管理",
+        "type": "list",
+        "default": [],
+        "hint": "每项填写 name、backend、model_profile、operation、workflow；后备路线与付费回退相互隔离。新版陪伴的官方 NAI 直连默认不受影响；仅 active 且存在匹配操作的 NAI 路线时由统一引擎接管。"
+      },
+      "workflow_mappings": {
+        "description": "ComfyUI 工作流映射覆盖",
+        "type": "list",
+        "default": [],
+        "hint": "仅在自动识别不确定时填写，映射会绑定工作流内容指纹。"
+      },
+      "output_validation": {
+        "description": "启用输出图片核验",
+        "type": "bool",
+        "default": true
+      },
+      "allowed_reference_roots": {
+        "description": "允许读取参考图的目录",
+        "type": "list",
+        "default": [],
+        "hint": "新引擎只允许读取这些目录内的参考图；留空时由旧链路的素材门禁接管。"
+      }
+    }
+  },
   "image": {
     "description": "图像生成",
     "type": "object",
