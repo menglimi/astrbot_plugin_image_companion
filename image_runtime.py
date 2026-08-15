@@ -25,7 +25,7 @@ import unicodedata
 import uuid
 import zoneinfo
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
@@ -164,6 +164,7 @@ from .reaction_expression import (
     reaction_expression_high_frequency,
 )
 from .photo_reference_catalog import (
+    CATALOG_VERSION,
     PhotoReference,
     build_daily_outfit_reference,
     load_catalog,
@@ -13371,7 +13372,14 @@ Output:
         if not stable_path:
             logger.info("[PrivateCompanion] 配置页人设参考图 URL 未能转为本地参考图: url=%s", _single_line(raw, 120))
             return ""
-        setter = getattr(self, "_set_photo_reference_config_path", None)
+        if catalog is not None and self._photo_reference_catalog_from_image_service:
+            setter = getattr(
+                object.__getattribute__(self, "_image_service"),
+                "_set_photo_reference_config_path",
+                None,
+            )
+        else:
+            setter = getattr(self, "_set_photo_reference_config_path", None)
         if callable(setter):
             try:
                 result = setter(stable_path)
@@ -13655,11 +13663,19 @@ Output:
             if path:
                 candidates.append(project_reference_candidate(item, resolved_source=path))
         if catalog_changed:
-            setter = getattr(
-                self,
-                "_set_photo_reference_catalog_config" if canonical_mode else "_set_photo_reference_library_config",
-                None,
+            setter_name = (
+                "_set_photo_reference_catalog_config"
+                if canonical_mode
+                else "_set_photo_reference_library_config"
             )
+            if canonical_mode and self._photo_reference_catalog_from_image_service:
+                setter = getattr(
+                    object.__getattribute__(self, "_image_service"),
+                    setter_name,
+                    None,
+                )
+            else:
+                setter = getattr(self, setter_name, None)
             if callable(setter):
                 try:
                     payload: Any = updated_catalog
@@ -21596,6 +21612,50 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         self._image_service = service
         self._image_owner = owner
         self.context = getattr(owner, "context", None)
+        service_catalog = service.image_setting(
+            "photo_reference_catalog",
+            _IMAGE_SETTING_UNSET,
+        )
+        catalog_from_service = service_catalog is not _IMAGE_SETTING_UNSET
+        raw_catalog = (
+            service_catalog
+            if catalog_from_service
+            else getattr(owner, "photo_reference_catalog", None)
+        )
+        self._photo_reference_catalog_from_image_service = catalog_from_service
+
+        # Normalize plugin-local dataclasses at the image-service boundary.
+        if raw_catalog is not None:
+            if isinstance(raw_catalog, (list, tuple)):
+                raw_catalog = [
+                    asdict(item)
+                    if is_dataclass(item) and not isinstance(item, type)
+                    else item
+                    for item in raw_catalog
+                ]
+            loaded_catalog = load_catalog(
+                raw_catalog,
+                catalog_version=CATALOG_VERSION,
+                legacy_persona=getattr(
+                    self,
+                    "photo_persona_reference_image_path",
+                    "",
+                ),
+                legacy_library=getattr(self, "photo_reference_library", []),
+                user_cleared=(
+                    bool(
+                        getattr(
+                            owner,
+                            "photo_reference_catalog_user_cleared",
+                            False,
+                        )
+                    )
+                    if not catalog_from_service
+                    else False
+                ),
+                preset_names=self._photo_generation_scene_presets().keys(),
+            )
+            self.photo_reference_catalog = loaded_catalog.references
         # Existing reference catalog entries may use paths relative to the
         # original plugin data directory. Preserve that resolution until the
         # user turns off asset reuse, while state itself is already owned by
@@ -21609,28 +21669,6 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         )
         self._data_lock = service.image_data_lock
         self._external_image_api_runtime_lock = asyncio.Lock()
-        self._normalize_split_photo_reference_catalog()
-
-    def _normalize_split_photo_reference_catalog(self) -> None:
-        raw_catalog = getattr(self, "photo_reference_catalog", None)
-        if raw_catalog is None:
-            return
-        loaded = load_catalog(
-            raw_catalog,
-            catalog_version=getattr(self, "photo_reference_catalog_version", 0),
-            legacy_persona=getattr(self, "photo_persona_reference_image_path", ""),
-            legacy_library=getattr(self, "photo_reference_library", []),
-            user_cleared=bool(
-                getattr(self, "photo_reference_catalog_user_cleared", False)
-            ),
-            preset_names=self._photo_generation_scene_presets().keys(),
-        )
-        self.photo_reference_catalog = loaded.references
-        for warning in loaded.warnings:
-            logger.debug(
-                "[ImageCompanion] 跨插件参考图目录兼容加载: %s",
-                _single_line(warning, 180),
-            )
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
