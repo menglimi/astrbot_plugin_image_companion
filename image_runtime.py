@@ -168,6 +168,7 @@ from .photo_reference_catalog import (
     build_daily_outfit_reference,
     load_catalog,
     project_reference_candidate,
+    validate_and_serialize,
 )
 from .photo_prompt_context import (
     PhotoPromptSection,
@@ -13662,7 +13663,12 @@ Output:
             if callable(setter):
                 try:
                     payload: Any = updated_catalog
-                    if not canonical_mode:
+                    if canonical_mode:
+                        payload = validate_and_serialize(
+                            updated_catalog,
+                            preset_names=self._photo_generation_scene_presets().keys(),
+                        )
+                    else:
                         payload = [
                             {
                                 "path": item.source,
@@ -21603,6 +21609,28 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         )
         self._data_lock = service.image_data_lock
         self._external_image_api_runtime_lock = asyncio.Lock()
+        self._normalize_split_photo_reference_catalog()
+
+    def _normalize_split_photo_reference_catalog(self) -> None:
+        raw_catalog = getattr(self, "photo_reference_catalog", None)
+        if raw_catalog is None:
+            return
+        loaded = load_catalog(
+            raw_catalog,
+            catalog_version=getattr(self, "photo_reference_catalog_version", 0),
+            legacy_persona=getattr(self, "photo_persona_reference_image_path", ""),
+            legacy_library=getattr(self, "photo_reference_library", []),
+            user_cleared=bool(
+                getattr(self, "photo_reference_catalog_user_cleared", False)
+            ),
+            preset_names=self._photo_generation_scene_presets().keys(),
+        )
+        self.photo_reference_catalog = loaded.references
+        for warning in loaded.warnings:
+            logger.debug(
+                "[ImageCompanion] 跨插件参考图目录兼容加载: %s",
+                _single_line(warning, 180),
+            )
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):

@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, Collection, Iterable, Literal, cast
 
 
@@ -207,6 +207,20 @@ class CatalogValidationError(ValueError):
         super().__init__("；".join(message for messages in errors.values() for message in messages))
 
 
+def _reference_payload(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, PhotoReference):
+        return dict(raw.__dict__)
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not all(hasattr(raw, field) for field in ("id", "kind", "source")):
+        return None
+    return {
+        field.name: getattr(raw, field.name)
+        for field in fields(PhotoReference)
+        if hasattr(raw, field.name)
+    }
+
+
 def _clean_text(value: Any, limit: int) -> str:
     return re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()[:limit]
 
@@ -367,11 +381,8 @@ def _strict_reference(
     errors: dict[str, list[str]],
 ) -> PhotoReference | None:
     prefix = f"items.{index}"
-    if isinstance(raw, PhotoReference):
-        item = raw.__dict__
-    elif isinstance(raw, dict):
-        item = dict(raw)
-    else:
+    item = _reference_payload(raw)
+    if item is None:
         _append_error(errors, prefix, "目录条目必须是对象")
         return None
     kind = _clean_text(item.get("kind"), 40).lower()
@@ -835,8 +846,8 @@ def _migrate_library_reference(
 
 
 def _catalog_items(raw_catalog: Any, warnings: list[str]) -> list[Any] | None:
-    if isinstance(raw_catalog, list):
-        return raw_catalog
+    if isinstance(raw_catalog, (list, tuple)):
+        return list(raw_catalog)
     if isinstance(raw_catalog, str) and raw_catalog.strip():
         try:
             parsed = json.loads(raw_catalog)
@@ -854,11 +865,8 @@ def _tolerant_catalog_reference(
     preset_names: Collection[str],
     warnings: list[str],
 ) -> PhotoReference | None:
-    if isinstance(raw_item, PhotoReference):
-        item = raw_item.__dict__
-    elif isinstance(raw_item, dict):
-        item = dict(raw_item)
-    else:
+    item = _reference_payload(raw_item)
+    if item is None:
         warnings.append(f"目录条目 {index + 1} 无效：条目必须是对象")
         return None
 
