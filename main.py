@@ -6,13 +6,16 @@ import asyncio
 import copy
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .helpers import _set_into_config
 from .image_runtime import ImageGenerationRuntime, _IMAGE_SETTING_UNSET
+from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and_serialize
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
@@ -285,6 +288,106 @@ class ImageCompanionPlugin(Star):
         if name in self.config:
             return self.config.get(name)
         return default
+
+    async def _save_config_if_possible(self) -> bool:
+        for method_name in ("save_config", "save", "save_conf"):
+            save = getattr(self.config, method_name, None)
+            if not callable(save):
+                continue
+            try:
+                result = save()
+                if asyncio.iscoroutine(result) or hasattr(result, "__await__"):
+                    await result
+                return True
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "[ImageCompanion] 自动保存配置失败: error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+        logger.warning("[ImageCompanion] 当前配置对象没有可用保存方法，本次修改未落盘")
+        return False
+
+    async def _set_image_config_value(self, name: str, value: Any) -> bool:
+        previous = copy.deepcopy(self.image_setting(name, _IMAGE_SETTING_UNSET))
+        if not _set_into_config(
+            self.config,
+            name,
+            value,
+            allow_flat_fallback=False,
+        ):
+            logger.warning("[ImageCompanion] 生图配置项不存在，拒绝回写: key=%s", name)
+            return False
+        if await self._save_config_if_possible():
+            return True
+        if previous is not _IMAGE_SETTING_UNSET:
+            _set_into_config(
+                self.config,
+                name,
+                previous,
+                allow_flat_fallback=False,
+            )
+        return False
+
+    def _photo_reference_preset_names(self) -> tuple[str, ...]:
+        presets = ImageGenerationRuntime._builtin_photo_generation_scene_presets(self)
+        presets.update(
+            ImageGenerationRuntime._parse_photo_generation_scene_presets(
+                self,
+                self.image_setting("photo_generation_scene_presets", ""),
+            )
+        )
+        return tuple(presets)
+
+    async def _set_photo_reference_catalog_config(self, items: Any) -> bool:
+        try:
+            serialized = validate_and_serialize(
+                items,
+                preset_names=self._photo_reference_preset_names(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ImageCompanion] 保存结构化参考图库失败: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        return await self._set_image_config_value(
+            "photo_reference_catalog",
+            serialized,
+        )
+
+    async def _set_photo_reference_config_path(self, path: str) -> bool:
+        clean = str(path or "").strip()[:1000]
+        raw_catalog = self.image_setting(
+            "photo_reference_catalog",
+            _IMAGE_SETTING_UNSET,
+        )
+        if raw_catalog is _IMAGE_SETTING_UNSET:
+            return await self._set_image_config_value(
+                "photo_persona_reference_image_path",
+                clean,
+            )
+        try:
+            loaded = load_catalog(
+                raw_catalog,
+                catalog_version=CATALOG_VERSION,
+                preset_names=self._photo_reference_preset_names(),
+            )
+            updated = tuple(
+                replace(item, source=clean)
+                if item.kind == "persona"
+                else item
+                for item in loaded.references
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ImageCompanion] 更新人设参考图失败: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        return await self._set_photo_reference_catalog_config(updated)
 
     def image_data_for(self, owner: Any) -> dict[str, Any]:
         """Keep generated image state in this plugin, with read-through context.
