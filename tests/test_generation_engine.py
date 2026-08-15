@@ -30,7 +30,13 @@ from generation_engine import (  # noqa: E402
     route_cache_key,
 )
 from generation_adapters import LegacyCallbackAdapter  # noqa: E402
-from generation_profiles import AnimaPromptCompiler, default_model_profile_registry  # noqa: E402
+from generation_profiles import (  # noqa: E402
+    AnimaPromptCompiler,
+    FRONT_FACING_CAMERA_PORTRAIT,
+    SELFIE_UI_NEGATIVE_TERMS,
+    append_selfie_ui_negative,
+    default_model_profile_registry,
+)
 
 
 def _spec(*, request_id: str = "r1") -> GenerationSpecV1:
@@ -138,6 +144,31 @@ class ContractAndCompilerTests(unittest.TestCase):
         self.assertIn("wool sweater", compiled.negative_prompt)
         self.assertNotIn("wool sweater", compiled.positive_prompt)
         self.assertNotRegex(compiled.positive_prompt, r"\d+(?:\.\d+)?::|[{}\[\]]")
+
+    def test_selfie_ui_contract_is_added_to_anima_negative_prompt(self):
+        compiled = AnimaPromptCompiler().compile(_spec())
+        for term in SELFIE_UI_NEGATIVE_TERMS:
+            self.assertIn(term, compiled.negative_prompt)
+        self.assertNotIn("mobile app UI", compiled.positive_prompt)
+
+    def test_selfie_ui_negative_helper_deduplicates_existing_terms(self):
+        compiled = append_selfie_ui_negative("bad hands, text, watermark")
+        self.assertEqual(1, compiled.split(", ").count("text"))
+        self.assertEqual(1, compiled.split(", ").count("watermark"))
+        self.assertIn("camera UI", compiled)
+        self.assertEqual("front-facing camera perspective, arm's-length portrait", FRONT_FACING_CAMERA_PORTRAIT)
+
+    def test_legacy_selfie_prompts_do_not_reintroduce_phone_ui_cues(self):
+        source = (ROOT / "image_runtime.py").read_text(encoding="utf-8")
+        for stale in (
+            "handheld selfie",
+            "natural phone snapshot",
+            "phone snapshot feeling",
+            "selfie-inspired outfit portrait composition",
+        ):
+            self.assertNotIn(stale, source)
+        for required in ("front-facing camera perspective", "SELFIE_UI_NEGATIVE_TERMS", "append_selfie_ui_negative"):
+            self.assertIn(required, source)
 
     def test_route_cache_is_isolated_by_profile_and_workflow(self):
         spec = _spec()

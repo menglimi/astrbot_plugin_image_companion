@@ -16,6 +16,37 @@ def _join(values: tuple[str, ...] | list[str]) -> str:
     return ", ".join(dict.fromkeys(value.strip() for value in values if value and value.strip()))
 
 
+FRONT_FACING_CAMERA_PORTRAIT = "front-facing camera perspective, arm's-length portrait"
+SELFIE_UI_NEGATIVE_TERMS = (
+    "social media interface",
+    "mobile app UI",
+    "camera UI",
+    "livestream overlay",
+    "profile avatar",
+    "username",
+    "buttons",
+    "interface icons",
+    "timestamp",
+    "subtitle",
+    "caption",
+    "text",
+    "watermark",
+    "logo",
+    "thumbnail strip",
+    "picture-in-picture",
+    "screenshot",
+    "screen border",
+    "decorative frame",
+    "HUD",
+    "navigation bar",
+)
+
+
+def append_selfie_ui_negative(value: str) -> str:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    return _join([*parts, *SELFIE_UI_NEGATIVE_TERMS])
+
+
 def _scene_phrases(spec: GenerationSpecV1) -> list[str]:
     scene = spec.scene
     values = [
@@ -111,6 +142,8 @@ class AnimaPromptCompiler:
             *spec.forbidden_concepts,
         ]
         negative = _join([self._remove_nai_syntax(value) for value in negative_values])
+        if spec.operation in {"selfie", "portrait"}:
+            negative = append_selfie_ui_negative(negative)
         return PromptPackageV1(
             model_profile=self.profile,
             positive_prompt=positive,
@@ -189,4 +222,5 @@ __all__ = [
     "PromptCompiler", "ModelProfileRegistry", "LegacyPromptCompiler",
     "AnimaPromptCompiler", "NaiPromptCompiler", "GenericNaturalPromptCompiler",
     "GenericTagPromptCompiler", "default_model_profile_registry",
+    "FRONT_FACING_CAMERA_PORTRAIT", "SELFIE_UI_NEGATIVE_TERMS", "append_selfie_ui_negative",
 ]

@@ -238,7 +238,12 @@ from .generation_contracts import (
     WeatherFactsV1,
 )
 from .generation_engine import CircuitBreaker, GenerationEngine
-from .generation_profiles import default_model_profile_registry
+from .generation_profiles import (
+    FRONT_FACING_CAMERA_PORTRAIT,
+    SELFIE_UI_NEGATIVE_TERMS,
+    append_selfie_ui_negative,
+    default_model_profile_registry,
+)
 
 _EXTERNAL_IMAGE_MAX_BYTES = 32 * 1024 * 1024
 _EXTERNAL_IMAGE_DOWNLOAD_MAX_ATTEMPTS = 2
@@ -9242,7 +9247,7 @@ Output:
         composition_style = (
             [
                 "daily outfit character illustration",
-                "selfie-inspired outfit portrait composition",
+                "front-facing camera outfit portrait composition",
                 "non-mirror casual illustrated portrait",
                 "soft illustrated lighting",
                 "clean illustrated background",
@@ -9250,10 +9255,10 @@ Output:
             ]
             if anime_style
             else [
-                "daily outfit selfie",
-                "selfie outfit photo",
-                "non-mirror handheld selfie or natural environmental outfit portrait",
-                "natural phone snapshot",
+                "daily outfit camera portrait",
+                "front-facing outfit portrait",
+                "front-facing camera perspective or natural environmental outfit portrait",
+                "clean full-frame camera portrait",
                 "soft natural light",
                 "clean background",
                 "lifelike daily atmosphere",
@@ -9326,6 +9331,7 @@ Output:
             "private screen",
             "nsfw",
             "revealing outfit",
+            *SELFIE_UI_NEGATIVE_TERMS,
         ]
         if anime_style:
             negative.extend(
@@ -11213,20 +11219,20 @@ Output:
             negative = "duplicated subject, twins, multiple people, outfit alternatives, comparison panels, split screen, side-by-side panels, collage, character sheet"
         elif explicit_mirror:
             positive = (
-                "Selfie composition: exactly one character wearing one coherent outfit in one continuous scene; "
+                "Mirror portrait composition: exactly one character wearing one coherent outfit in one continuous scene; "
                 "one mirror reflection of that same outfit is allowed; keep the complete face visible and do not let the phone cover it."
             )
             negative = "duplicated subject, outfit alternatives, comparison panels, split screen, side-by-side panels, collage, character sheet, phone covering face"
         else:
             positive = (
-                "Selfie composition: exactly one character wearing one coherent outfit in one continuous scene; keep the face visible, "
-                "prefer a handheld selfie or natural environmental portrait with upper-body to three-quarter framing, and place the character naturally in the resolved scene."
+                "Camera portrait composition: exactly one character wearing one coherent outfit in one continuous scene; keep the face visible, "
+                "prefer a front-facing camera perspective or natural environmental portrait with upper-body to three-quarter framing, and place the character naturally in the resolved scene."
             )
             negative = (
                 "duplicate character, twins, multiple people, multiple outfits, outfit comparison, before and after, split screen, "
                 "side-by-side panels, diptych, collage, character sheet, mirror selfie, full-length mirror selfie, dressing-room mirror, phone covering face"
             )
-        return positive, negative
+        return positive, append_selfie_ui_negative(negative)
 
     @staticmethod
     def _photo_generation_subject_count_contract(
@@ -11345,7 +11351,7 @@ Output:
         replacements = (
             (r"\bfull[-\s]?length\s+mirror\s+(?:selfie|shot|photo|portrait)\b", "natural upper-body to three-quarter portrait"),
             (r"\bfull[-\s]?body\s+mirror\s+(?:selfie|shot|photo|portrait)\b", "natural upper-body to three-quarter portrait"),
-            (r"\bmirror\s+(?:selfie|shot|photo|portrait)\b", "handheld selfie or natural environmental portrait"),
+            (r"\bmirror\s+(?:selfie|shot|photo|portrait)\b", "front-facing camera perspective or natural environmental portrait"),
             (r"\bstanding\s+in\s+front\s+of\s+(?:a\s+)?mirror\b", "standing naturally in the current location"),
             (r"\bdressing[-\s]?room\s+mirror\b", "current-location background"),
             (r"\bphone\s+covering\s+(?:the\s+)?face\b", "visible face"),
@@ -11380,13 +11386,13 @@ Output:
             )
         elif explicit_mirror:
             guard = (
-                "Selfie composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
+                "Mirror portrait composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
                 "a single mirror reflection of that same outfit is allowed, but do not create outfit alternatives, comparison panels, duplicated subjects, or a collage; "
                 "keep the face visible and avoid the phone covering the face."
             )
         else:
             guard = (
-                "Default selfie composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
+                "Default camera portrait composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
                 "no duplicated subject, outfit alternatives, comparison layout, split screen, side-by-side panels, diptych, collage, or character sheet; "
                 "no mirror selfie or full-length mirror shot unless explicitly requested; keep the face visible, avoid phone covering face, "
                 "use upper-body to three-quarter framing, and place the character naturally in the current scene."
@@ -11405,6 +11411,7 @@ Output:
             "collage",
             "character sheet",
         ]
+        negative_terms.extend(SELFIE_UI_NEGATIVE_TERMS)
         if not explicit_mirror and not explicit_back_view:
             negative_terms.extend(
                 ["mirror selfie", "full-length mirror selfie", "full body mirror shot", "dressing room mirror"]
@@ -11435,15 +11442,15 @@ Output:
         return {
             "角色自拍": (
                 "natural casual character photo, single character, face visible by default, clear face, hair, expression, neck and shoulders, "
-                "phone snapshot feeling, lifelike composition, no cropped head, no hidden face or back view unless explicitly requested, no body-only framing"
+                "clean full-frame camera portrait, lifelike composition, no cropped head, no hidden face or back view unless explicitly requested, no body-only framing"
             ),
             "COS自拍": (
-                "cosplay themed selfie, keep the character's own face, hair color, eye color, and key visual traits, "
-                "clear costume theme, tasteful outfit, convention snapshot or room fitting photo feeling"
+                "cosplay themed front-facing camera portrait, keep the character's own face, hair color, eye color, and key visual traits, "
+                "clear costume theme, tasteful outfit, convention portrait or room fitting photo feeling"
             ),
             "日常穿搭": (
                 "daily outfit portrait without mirror, exactly one character wearing one coherent outfit in one continuous frame, "
-                "no outfit comparison, no split screen, no side-by-side panels, handheld selfie or natural environmental portrait, "
+                "no outfit comparison, no split screen, no side-by-side panels, front-facing camera perspective or natural environmental portrait, "
                 "upper-body to three-quarter framing, visible face, clear clothing layers and color palette, "
                 "location-appropriate background, no phone covering face, not body-only"
             ),
@@ -19284,7 +19291,13 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         activity = self._unified_scene_field(r"当前日程[：:]\s*([^；;]+)", scene_context, 240)
         sleep_phase = "preparing_for_sleep" if wardrobe.category == "sleepwear" else "awake"
         required = tuple(dict.fromkeys((wardrobe.category, *(getattr(ambient_policy, "required", ()) or ()))))
-        forbidden = tuple(dict.fromkeys((*(getattr(ambient_policy, "forbidden", ()) or ()), wardrobe.negative_instruction)))
+        forbidden_values = [
+            *(getattr(ambient_policy, "forbidden", ()) or ()),
+            wardrobe.negative_instruction,
+        ]
+        if operation in {"selfie", "portrait"}:
+            forbidden_values.extend(SELFIE_UI_NEGATIVE_TERMS)
+        forbidden = tuple(dict.fromkeys(item for item in forbidden_values if item))
         references: list[ReferenceBindingV1] = []
         for binding, candidate, path in reference_entries:
             roles = []
@@ -19355,7 +19368,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             ),
             references=tuple(references),
             composition=CompositionSpecV1(
-                shot="selfie portrait" if operation in {"selfie", "portrait"} else operation,
+                shot=FRONT_FACING_CAMERA_PORTRAIT if operation in {"selfie", "portrait"} else operation,
                 location=location,
                 instructions=(activity,) if activity else (),
             ),
