@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,8 @@ from .image_runtime import ImageGenerationRuntime, _IMAGE_SETTING_UNSET
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
+PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
@@ -196,6 +198,50 @@ class ImageCompanionPlugin(Star):
         self.extension_api = ImageCompanionExtensionAPI(self)
         _active_plugin = self
 
+    async def initialize(self) -> None:
+        register_api = getattr(self.context, "register_web_api", None)
+        if not callable(register_api):
+            logger.warning("[ImageCompanion] 当前 AstrBot 不支持插件拓展页 API")
+            return
+        register_api(
+            f"{PAGE_API_PREFIX}/status",
+            self.page_status,
+            ["GET"],
+            "Image Companion status",
+        )
+
+    def _private_companion_api(self) -> Any | None:
+        module_names = (
+            "data.plugins.astrbot_plugin_private_companion.main",
+            "astrbot_plugin_private_companion.main",
+        )
+        suffixes = tuple(name.removeprefix("data.plugins.") for name in module_names)
+        modules = [sys.modules.get(name) for name in module_names]
+        modules.extend(
+            module
+            for name, module in list(sys.modules.items())
+            if module is not None and any(name.endswith(suffix) for suffix in suffixes)
+        )
+        for module in modules:
+            if module is None:
+                continue
+            getter = getattr(module, "get_private_companion_api", None)
+            try:
+                api = getter() if callable(getter) else None
+            except Exception:
+                api = None
+            if api is not None:
+                return api
+        getter = getattr(self.context, "get_registered_star", None)
+        if callable(getter):
+            try:
+                metadata = getter("astrbot_plugin_private_companion")
+                instance = getattr(metadata, "star_cls", None) if metadata is not None else None
+                return getattr(instance, "extension_api", None)
+            except Exception:
+                pass
+        return None
+
     def _cfg(self, key: str, default: Any) -> Any:
         if key in self.config:
             return self.config.get(key, default)
@@ -299,12 +345,16 @@ class ImageCompanionPlugin(Star):
     def status(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "managed_by_private_companion": self._private_companion_api() is not None,
             "state": "compatibility_migration" if self.reuse_private_companion_settings else "independent",
             "reuse_private_companion_settings": self.reuse_private_companion_settings,
             "reuse_private_companion_assets": self.reuse_private_companion_assets,
             "generation_count": self.generation_count,
             "last_generation": copy.deepcopy(self.last_generation),
         }
+
+    async def page_status(self) -> dict[str, Any]:
+        return {"ok": True, "data": self.status()}
 
     async def terminate(self) -> None:
         global _active_plugin
