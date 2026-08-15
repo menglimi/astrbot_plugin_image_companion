@@ -62,6 +62,7 @@ __all__ = [
     "PhotoPromptSection",
     "ResolvedPhotoPromptContext",
     "compile_local_photo_prompt",
+    "compile_local_photo_negative_prompt",
     "resolve_photo_prompt_context",
 ]
 
@@ -819,6 +820,27 @@ def compile_local_photo_prompt(
             seen.add(key)
             values.append(value)
     return ", ".join(values).strip()
+
+
+def compile_local_photo_negative_prompt(
+    sections: Sequence[PhotoPromptSection],
+    prompt_format: str,
+) -> str:
+    """Compile only negative constraints for a dedicated local workflow slot."""
+    mode = str(prompt_format or "traditional").strip().lower().replace("-", "_")
+    values: list[str] = []
+    seen: set[str] = set()
+    for section in sections:
+        value = _clip(section.negative, 1600)
+        if not value:
+            continue
+        if mode == "nai":
+            value = re.sub(r"^-?\d+(?:\.\d+)?::(.*?)::$", r"\1", value).strip()
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            values.append(value)
+    return ", ".join(values).strip(" ,")
 
 
 def _reference_roles(reference: Any, wardrobe: Any) -> tuple[str, ...]:

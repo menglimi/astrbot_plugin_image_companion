@@ -256,6 +256,7 @@ class PhotoWardrobeIntent:
     excluded_categories: tuple[str, ...] = ()
     exclusion_text: str = ""
     positive_text: str = ""
+    source: str = "user_prompt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +423,7 @@ def merge_photo_wardrobe_continuity(
         continuity,
         excluded_categories=intent.excluded_categories,
         exclusion_text=intent.exclusion_text,
+        source="dialogue_continuity",
     )
 
 
@@ -870,10 +872,12 @@ def resolve_photo_wardrobe_decision(
             if resolved_intent.exclusion_text
             else ""
         )
+        intent_source = _clean_text(resolved_intent.source, 40) or "user_prompt"
+        ambient_intent = intent_source == "ambient_context"
         return PhotoWardrobeDecision(
-            rule_id="explicit_prompt",
-            mode="explicit_prompt",
-            source="user_prompt",
+            rule_id="ambient_context" if ambient_intent else "explicit_prompt",
+            mode="ambient_context" if ambient_intent else "explicit_prompt",
+            source=intent_source,
             category=explicit_category,
             lock_outfit=True,
             remove_daily_outfit_context=remove_daily,
@@ -925,7 +929,9 @@ def resolve_photo_wardrobe_decision(
                 if part
             ),
             reason=(
-                "explicit custom or generic clothing change in the current image prompt"
+                "ambient time, location, activity, or weather context"
+                if ambient_intent
+                else "explicit custom or generic clothing change in the current image prompt"
                 if explicit_category == "custom_outfit"
                 else "explicit clothing request in the current image prompt"
             ),

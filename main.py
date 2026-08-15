@@ -15,11 +15,12 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .helpers import _set_into_config
 from .image_runtime import ImageGenerationRuntime, _IMAGE_SETTING_UNSET
+from .generation_config import active_engine_claims_profile, route_diagnostics
 from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and_serialize
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.2.2"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
@@ -99,6 +100,41 @@ class ImageCompanionExtensionAPI:
 
     def status(self) -> dict[str, Any]:
         return self._plugin.status()
+
+    def generation_route_diagnostics(self) -> dict[str, Any]:
+        """Return redacted route validation and a non-mutating migration preview."""
+        return route_diagnostics(self._plugin.config)
+
+    def claims_model_profile(self, model_profile: str, *, operation: str = "") -> bool:
+        """Tell companion bridges when the active unified engine owns a route."""
+        return active_engine_claims_profile(
+            getattr(self._plugin, "config", {}) or {},
+            model_profile,
+            operation=operation,
+        )
+
+    def _comfyui_service(self, owner: Any) -> Any:
+        service = ImageGenerationRuntime(self._plugin, owner)._get_comfyui_public_service()
+        if service is None:
+            raise RuntimeError("ComfyUI public service is unavailable")
+        return service
+
+    def list_comfyui_workflows(self, owner: Any) -> list[dict[str, Any]]:
+        """Return structured workflow capabilities for an advanced settings UI."""
+        return self._comfyui_service(owner).list_workflows()
+
+    def inspect_comfyui_workflow(self, owner: Any, workflow_id: str) -> dict[str, Any]:
+        return self._comfyui_service(owner).inspect_workflow(workflow_id)
+
+    def validate_comfyui_mapping(
+        self,
+        owner: Any,
+        workflow_id: str,
+        mapping: dict[str, Any],
+        *,
+        save: bool = False,
+    ) -> dict[str, Any]:
+        return self._comfyui_service(owner).validate_mapping(workflow_id, mapping, save=save)
 
     def capability_status(self, owner: Any) -> dict[str, Any]:
         if not self._plugin.enabled:
@@ -446,6 +482,7 @@ class ImageCompanionPlugin(Star):
                 logger.warning("[ImageCompanion] 保存独立生图状态失败: error_type=%s", type(exc).__name__)
 
     def status(self) -> dict[str, Any]:
+        metrics = getattr(self, "generation_metrics", None)
         return {
             "enabled": self.enabled,
             "managed_by_private_companion": self._private_companion_api() is not None,
@@ -454,6 +491,8 @@ class ImageCompanionPlugin(Star):
             "reuse_private_companion_assets": self.reuse_private_companion_assets,
             "generation_count": self.generation_count,
             "last_generation": copy.deepcopy(self.last_generation),
+            "unified_engine": route_diagnostics(getattr(self, "config", {}) or {}),
+            "metrics": metrics.snapshot() if callable(getattr(metrics, "snapshot", None)) else {},
         }
 
     async def page_status(self) -> dict[str, Any]:

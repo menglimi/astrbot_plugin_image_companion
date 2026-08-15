@@ -174,6 +174,7 @@ from .photo_reference_catalog import (
 from .photo_prompt_context import (
     PhotoPromptSection,
     _clip as _clip_photo_prompt_text,
+    compile_local_photo_negative_prompt,
     compile_local_photo_prompt,
     resolve_photo_prompt_context,
 )
@@ -210,6 +211,38 @@ from .photo_wardrobe_decision import (
     analyze_photo_wardrobe,
     merge_photo_wardrobe_continuity,
     resolve_photo_wardrobe_decision,
+)
+from .generation_policy import (
+    apply_ambient_wardrobe_intent,
+    character_identity_appearance_from_persona,
+    extract_temperature_facts,
+    infer_ambient_wardrobe_policy,
+    outfit_context_fingerprint,
+    hot_outfit_fields,
+)
+from .generation_adapters import (
+    ComfyUIServiceAdapter,
+    GenerationMetrics,
+    OnlineEndpointAdapter,
+    validate_output_image,
+)
+from .generation_config import build_route_registry, parse_rollout_config
+from .generation_contracts import (
+    CharacterIdentitySpecV1,
+    CompositionSpecV1,
+    GenerationResultV1,
+    GenerationSpecV1,
+    ReferenceBindingV1,
+    SceneContextV1,
+    WardrobeSpecV1,
+    WeatherFactsV1,
+)
+from .generation_engine import CircuitBreaker, GenerationEngine
+from .generation_profiles import (
+    FRONT_FACING_CAMERA_PORTRAIT,
+    SELFIE_UI_NEGATIVE_TERMS,
+    append_selfie_ui_negative,
+    default_model_profile_registry,
 )
 
 _EXTERNAL_IMAGE_MAX_BYTES = 32 * 1024 * 1024
@@ -8584,7 +8617,12 @@ Output:
         today = _today_key()
         async with self._data_lock:
             existing = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
-            if not force and existing.get("date") == today:
+            if (
+                not force
+                and existing.get("date") == today
+                and _single_line(existing.get("context_fingerprint"), 80)
+                == self._daily_outfit_context_fingerprint()
+            ):
                 return dict(existing)
         lock = getattr(self, "_daily_outfit_photo_generation_lock", None)
         if lock is None:
@@ -8593,7 +8631,12 @@ Output:
         async with lock:
             async with self._data_lock:
                 existing = self.data.get("daily_outfit_photo") if isinstance(self.data.get("daily_outfit_photo"), dict) else {}
-                if not force and existing.get("date") == today:
+                if (
+                    not force
+                    and existing.get("date") == today
+                    and _single_line(existing.get("context_fingerprint"), 80)
+                    == self._daily_outfit_context_fingerprint()
+                ):
                     return dict(existing)
             return await self._ensure_daily_outfit_photo_unlocked(diary, force=force, today=today)
 
@@ -8694,6 +8737,7 @@ Output:
             "note": _single_line(note, 220),
             "generated_at": _now_ts(),
             "outfit_profile": self._normalize_daily_outfit_profile(outfit_profile),
+            "context_fingerprint": self._daily_outfit_context_fingerprint(),
         }
         async with self._data_lock:
             history = self._daily_outfit_history_items(include_current=True)
@@ -8720,8 +8764,17 @@ Output:
         items = plan.get("items")
         if not isinstance(items, list) or not items:
             return ""
+        current_getter = getattr(self, "_get_current_plan_item", None)
+        current_item = None
+        if callable(current_getter):
+            try:
+                candidate = current_getter(plan)
+                current_item = candidate if isinstance(candidate, dict) else None
+            except Exception:
+                current_item = None
+        selected_items = [current_item] if current_item else items[:1]
         lines: list[str] = []
-        for item in items[:12]:
+        for item in selected_items:
             if not isinstance(item, dict):
                 continue
             time_text = _single_line(item.get("time"), 12)
@@ -8734,6 +8787,33 @@ Output:
                 line = f"{line}（{mood}）"
             lines.append(line)
         return _single_line("；".join(lines), 620)
+
+    def _daily_outfit_context_fingerprint(self) -> str:
+        captured = datetime.now().astimezone()
+        daypart = "late_night" if captured.hour >= 22 or captured.hour < 5 else (
+            "morning" if captured.hour < 12 else "afternoon" if captured.hour < 18 else "evening"
+        )
+        schedule = self._daily_outfit_schedule_text()
+        weather = self._format_weather_for_prompt()
+        state = self.data.get("daily_state") if isinstance(getattr(self, "data", None), dict) else {}
+        state = state if isinstance(state, dict) else {}
+        location = _single_line(state.get("location"), 80)
+        location_type = "home" if re.search(r"家|卧室|客厅|房间|home|bedroom", location, flags=re.I) else (
+            "outdoor" if location else "unknown"
+        )
+        route_key = "/".join(
+            (
+                _single_line(getattr(self, "photo_generation_backend", "auto"), 40) or "auto",
+                _single_line(self._choose_photo_workflow_name("selfie"), 100) or "default",
+            )
+        )
+        return outfit_context_fingerprint(
+            daypart=daypart,
+            location_type=location_type,
+            current_activity=schedule,
+            thermal_level=extract_temperature_facts(weather).thermal_level,
+            route_key=route_key,
+        )
 
     @staticmethod
     def _normalize_daily_outfit_profile(profile: Any) -> dict[str, str]:
@@ -8828,6 +8908,11 @@ Output:
     @staticmethod
     def _daily_outfit_weather_kind(weather: str) -> str:
         text = _single_line(weather, 240).lower()
+        thermal_level = extract_temperature_facts(text).thermal_level
+        if thermal_level == "hot":
+            return "hot"
+        if thermal_level in {"cool", "cold"}:
+            return "cold"
         if any(token in text for token in ("冷", "降温", "低温", "寒", "雪", "snow", "cold")):
             return "cold"
         if any(token in text for token in ("热", "高温", "闷", "暑", "hot", "heat")):
@@ -8965,6 +9050,9 @@ Output:
                 {"palette": "warm brown, ivory, and muted orange", "silhouette": "textured everyday silhouette", "top": "ivory henley shirt beneath a warm-brown knit vest", "bottom": "muted-orange straight trousers", "accessory": "small leather bracelet or watch"},
             ],
         }
+        if weather_kind == "hot":
+            for index, base in enumerate(base_options.get(scene, base_options["daily"])):
+                base.update(hot_outfit_fields(scene, index))
         outer_options = self._daily_outfit_outer_options(scene, weather_kind)
         candidates: list[dict[str, str]] = []
         for base_index, base in enumerate(base_options.get(scene, base_options["daily"])):
@@ -9122,7 +9210,7 @@ Output:
         composition_style = (
             [
                 "daily outfit character illustration",
-                "selfie-inspired outfit portrait composition",
+                "front-facing camera outfit portrait composition",
                 "non-mirror casual illustrated portrait",
                 "soft illustrated lighting",
                 "clean illustrated background",
@@ -9130,10 +9218,10 @@ Output:
             ]
             if anime_style
             else [
-                "daily outfit selfie",
-                "selfie outfit photo",
-                "non-mirror handheld selfie or natural environmental outfit portrait",
-                "natural phone snapshot",
+                "daily outfit camera portrait",
+                "front-facing outfit portrait",
+                "front-facing camera perspective or natural environmental outfit portrait",
+                "clean full-frame camera portrait",
                 "soft natural light",
                 "clean background",
                 "lifelike daily atmosphere",
@@ -9206,6 +9294,7 @@ Output:
             "private screen",
             "nsfw",
             "revealing outfit",
+            *SELFIE_UI_NEGATIVE_TERMS,
         ]
         if anime_style:
             negative.extend(
@@ -9368,14 +9457,15 @@ Output:
         if not text:
             return ""
         hints: list[str] = []
+        thermal_level = extract_temperature_facts(text).thermal_level
         if any(token in text for token in ("雨", "阵雨", "雷", "storm", "rain")):
             hints.append("rainy-day atmosphere, umbrella or damp ground, light jacket")
         if any(token in text for token in ("风", "大风", "强对流", "wind")):
             hints.append("windy feeling, slightly wind-blown hair and hem")
-        if any(token in text for token in ("冷", "降温", "低温", "寒", "snow")):
+        if thermal_level in {"cool", "cold"} or any(token in text for token in ("冷", "降温", "低温", "寒", "snow")):
             hints.append("cold weather, warm outerwear")
-        if any(token in text for token in ("热", "高温", "闷", "暑", "hot")):
-            hints.append("hot weather, light breathable clothes")
+        if thermal_level == "hot" or any(token in text for token in ("热", "高温", "闷", "暑", "hot")):
+            hints.append("hot weather, lightweight breathable summer clothes, no sweater, no thick knitwear, no hoodie, no heavy coat")
         return _single_line(", ".join(dict.fromkeys(hints)), 140)
 
     def _daily_outfit_outfit_hint(
@@ -11092,20 +11182,20 @@ Output:
             negative = "duplicated subject, twins, multiple people, outfit alternatives, comparison panels, split screen, side-by-side panels, collage, character sheet"
         elif explicit_mirror:
             positive = (
-                "Selfie composition: exactly one character wearing one coherent outfit in one continuous scene; "
+                "Mirror portrait composition: exactly one character wearing one coherent outfit in one continuous scene; "
                 "one mirror reflection of that same outfit is allowed; keep the complete face visible and do not let the phone cover it."
             )
             negative = "duplicated subject, outfit alternatives, comparison panels, split screen, side-by-side panels, collage, character sheet, phone covering face"
         else:
             positive = (
-                "Selfie composition: exactly one character wearing one coherent outfit in one continuous scene; keep the face visible, "
-                "prefer a handheld selfie or natural environmental portrait with upper-body to three-quarter framing, and place the character naturally in the resolved scene."
+                "Camera portrait composition: exactly one character wearing one coherent outfit in one continuous scene; keep the face visible, "
+                "prefer a front-facing camera perspective or natural environmental portrait with upper-body to three-quarter framing, and place the character naturally in the resolved scene."
             )
             negative = (
                 "duplicate character, twins, multiple people, multiple outfits, outfit comparison, before and after, split screen, "
                 "side-by-side panels, diptych, collage, character sheet, mirror selfie, full-length mirror selfie, dressing-room mirror, phone covering face"
             )
-        return positive, negative
+        return positive, append_selfie_ui_negative(negative)
 
     @staticmethod
     def _photo_generation_subject_count_contract(
@@ -11224,7 +11314,7 @@ Output:
         replacements = (
             (r"\bfull[-\s]?length\s+mirror\s+(?:selfie|shot|photo|portrait)\b", "natural upper-body to three-quarter portrait"),
             (r"\bfull[-\s]?body\s+mirror\s+(?:selfie|shot|photo|portrait)\b", "natural upper-body to three-quarter portrait"),
-            (r"\bmirror\s+(?:selfie|shot|photo|portrait)\b", "handheld selfie or natural environmental portrait"),
+            (r"\bmirror\s+(?:selfie|shot|photo|portrait)\b", "front-facing camera perspective or natural environmental portrait"),
             (r"\bstanding\s+in\s+front\s+of\s+(?:a\s+)?mirror\b", "standing naturally in the current location"),
             (r"\bdressing[-\s]?room\s+mirror\b", "current-location background"),
             (r"\bphone\s+covering\s+(?:the\s+)?face\b", "visible face"),
@@ -11259,13 +11349,13 @@ Output:
             )
         elif explicit_mirror:
             guard = (
-                "Selfie composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
+                "Mirror portrait composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
                 "a single mirror reflection of that same outfit is allowed, but do not create outfit alternatives, comparison panels, duplicated subjects, or a collage; "
                 "keep the face visible and avoid the phone covering the face."
             )
         else:
             guard = (
-                "Default selfie composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
+                "Default camera portrait composition guard: exactly one character wearing exactly one coherent outfit in one continuous scene; "
                 "no duplicated subject, outfit alternatives, comparison layout, split screen, side-by-side panels, diptych, collage, or character sheet; "
                 "no mirror selfie or full-length mirror shot unless explicitly requested; keep the face visible, avoid phone covering face, "
                 "use upper-body to three-quarter framing, and place the character naturally in the current scene."
@@ -11284,6 +11374,7 @@ Output:
             "collage",
             "character sheet",
         ]
+        negative_terms.extend(SELFIE_UI_NEGATIVE_TERMS)
         if not explicit_mirror and not explicit_back_view:
             negative_terms.extend(
                 ["mirror selfie", "full-length mirror selfie", "full body mirror shot", "dressing room mirror"]
@@ -11314,15 +11405,15 @@ Output:
         return {
             "角色自拍": (
                 "natural casual character photo, single character, face visible by default, clear face, hair, expression, neck and shoulders, "
-                "phone snapshot feeling, lifelike composition, no cropped head, no hidden face or back view unless explicitly requested, no body-only framing"
+                "clean full-frame camera portrait, lifelike composition, no cropped head, no hidden face or back view unless explicitly requested, no body-only framing"
             ),
             "COS自拍": (
-                "cosplay themed selfie, keep the character's own face, hair color, eye color, and key visual traits, "
-                "clear costume theme, tasteful outfit, convention snapshot or room fitting photo feeling"
+                "cosplay themed front-facing camera portrait, keep the character's own face, hair color, eye color, and key visual traits, "
+                "clear costume theme, tasteful outfit, convention portrait or room fitting photo feeling"
             ),
             "日常穿搭": (
                 "daily outfit portrait without mirror, exactly one character wearing one coherent outfit in one continuous frame, "
-                "no outfit comparison, no split screen, no side-by-side panels, handheld selfie or natural environmental portrait, "
+                "no outfit comparison, no split screen, no side-by-side panels, front-facing camera perspective or natural environmental portrait, "
                 "upper-body to three-quarter framing, visible face, clear clothing layers and color palette, "
                 "location-appropriate background, no phone covering face, not body-only"
             ),
@@ -11615,6 +11706,31 @@ Output:
                 wardrobe_intent,
                 continuity_request,
             )
+        ambient_wardrobe_policy = infer_ambient_wardrobe_policy(
+            workflow_kind=workflow_kind,
+            scene_context=scene_context_before,
+            weather=scene_context_before,
+        )
+        wardrobe_intent = apply_ambient_wardrobe_intent(
+            wardrobe_intent,
+            ambient_wardrobe_policy,
+        )
+        effective_requested_outfit_category = (
+            str(wardrobe_intent.target_category or "").strip().lower()
+        )
+        self._append_photo_generation_trace_event(
+            trace_id,
+            "ambient_wardrobe_policy",
+            data={
+                "category": ambient_wardrobe_policy.category,
+                "source": ambient_wardrobe_policy.source,
+                "rule_id": ambient_wardrobe_policy.rule_id,
+                "thermal_level": ambient_wardrobe_policy.thermal_level,
+                "required": list(ambient_wardrobe_policy.required),
+                "forbidden": list(ambient_wardrobe_policy.forbidden),
+                "reason": ambient_wardrobe_policy.reason,
+            },
+        )
         current_user_request = wardrobe_intent.positive_text
         current_user_exclusions = wardrobe_intent.exclusion_text
         selection_request = self._photo_prompt_clip(
@@ -11644,7 +11760,7 @@ Output:
             explicit_reference_paths=explicit_reference_paths,
             require_existing_paths=True,
             trace_id=trace_id,
-            requested_outfit_category=user_requested_outfit_category,
+            requested_outfit_category=effective_requested_outfit_category,
         )
         self._append_photo_generation_trace_event(
             trace_id,
@@ -11992,6 +12108,10 @@ Output:
             resolved_context.prompt_sections,
             prompt_format,
         ) or self._comfyui_renderable_prompt_text(prompt_text)
+        local_backend_negative_prompt_text = compile_local_photo_negative_prompt(
+            resolved_context.prompt_sections,
+            prompt_format,
+        )
         reference_candidate = dict(resolved_context.reference or {})
         if structured_reference_plan:
             # The public generation record retains only the managed asset ID and
@@ -12205,6 +12325,35 @@ Output:
                 bool(reference_image_path),
             )
         preferred = self.photo_generation_backend
+        unified_result = await self._run_unified_generation_engine(
+            workflow_kind=workflow_kind,
+            request_id=trace_id,
+            request_text=current_user_request or original_prompt_text,
+            legacy_prompt=local_backend_prompt_text,
+            scene_context=scene_context_after or scene_context_before,
+            wardrobe=wardrobe,
+            ambient_policy=ambient_wardrobe_policy,
+            reference_entries=submitted_reference_entries,
+            session_key=session_key,
+            managed_reference_gate=structured_reference_gate,
+            managed_reference_plan=structured_reference_plan,
+        )
+        if unified_result is not None:
+            self._append_photo_generation_trace_event(
+                trace_id,
+                "unified_engine_result",
+                status="ok" if unified_result.ok else "shadow" if "shadow_mode" in unified_result.note else "error",
+                data={
+                    "backend": unified_result.backend,
+                    "model_profile": unified_result.model_profile,
+                    "workflow": unified_result.workflow,
+                    "task_id": unified_result.task_id,
+                    "error_code": unified_result.error_code,
+                    "failure_stage": unified_result.failure_stage,
+                    "degraded_capabilities": list(unified_result.degraded_capabilities),
+                    "trace": [dict(item) for item in unified_result.trace],
+                },
+            )
         self._append_photo_generation_trace_event(
             trace_id,
             "backend_selected",
@@ -12446,6 +12595,24 @@ Output:
                 "生图上下文仍存在未能安全清理的服装冲突，已停止调用后端",
             )
 
+        if unified_result is not None:
+            rollout = parse_rollout_config(getattr(self._image_service, "config", {}) or {})
+            if unified_result.ok:
+                return finish(
+                    f"统一引擎/{unified_result.backend}/{unified_result.model_profile}",
+                    unified_result.image_path,
+                    unified_result.note or "ok",
+                    reference_submitted=bool(unified_result.submitted_reference_ids),
+                    generation_completed=unified_result.generation_completed,
+                )
+            if rollout.mode == "active" and rollout.engine_enabled:
+                return finish(
+                    f"统一引擎/{unified_result.backend or 'route'}",
+                    "",
+                    unified_result.note or unified_result.error_code or "统一生图路线失败",
+                    failure_stage=unified_result.failure_stage,
+                )
+
         if structured_reference_plan:
             if not self._comfyui_photo_available():
                 return finish(
@@ -12476,6 +12643,7 @@ Output:
             image_path, note = await self._run_comfyui_photo_workflow(
                 workflow_name,
                 local_backend_prompt_text,
+                negative_prompt_text=local_backend_negative_prompt_text,
                 session_key=session_key,
                 reference_asset_gate=structured_reference_gate,
                 reference_asset_ticket=reference_asset_ticket,
@@ -12507,6 +12675,7 @@ Output:
             image_path, note = await self._run_comfyui_photo_workflow(
                 workflow_name,
                 local_backend_prompt_text,
+                negative_prompt_text=local_backend_negative_prompt_text,
                 session_key=session_key,
                 reference_image_path=reference_image_path,
                 reference_image_paths=reference_image_paths,
@@ -12634,6 +12803,7 @@ Output:
                     image_path, note = await self._run_comfyui_photo_workflow(
                         workflow_name,
                         local_backend_prompt_text,
+                        negative_prompt_text=local_backend_negative_prompt_text,
                         session_key=session_key,
                         reference_image_path=reference_image_path,
                         reference_image_paths=reference_image_paths,
@@ -15291,6 +15461,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         workflow_name: str,
         prompt_text: str,
         session_key: str,
+        negative_prompt_text: str = "",
         reference_image_path: str = "",
         image_size: str = "",
         reference_image_paths: Any = (),
@@ -15453,9 +15624,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             )
             if image_encoding_error:
                 return "", image_encoding_error
+            text_inputs = [submitted_prompt_text]
+            if text_count >= 2:
+                text_inputs.append(_single_line(negative_prompt_text, 2400))
+            if text_count > len(text_inputs):
+                text_inputs.extend("" for _ in range(text_count - len(text_inputs)))
             prompt_id = await workflow.submit_only(
                 encoded_input_images,
-                [submitted_prompt_text] * max(1, text_count),
+                text_inputs,
                 [],
                 debug=debug,
             )
@@ -18941,6 +19117,292 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             except Exception:
                 continue
         return None
+
+    def _get_comfyui_public_service(self) -> Any | None:
+        getter = getattr(getattr(self, "context", None), "get_registered_star", None)
+        if callable(getter):
+            for name in ("comfyui", "ComfyUI", "astrbot_plugin_comfyui"):
+                try:
+                    plugin = getter(name)
+                except Exception:
+                    plugin = None
+                service = getattr(plugin, "public_service", None)
+                if service is not None:
+                    return service
+        for obj in gc.get_objects():
+            try:
+                if "astrbot_plugin_comfyui" not in str(getattr(obj.__class__, "__module__", "")):
+                    continue
+                service = getattr(obj, "public_service", None)
+                if service is not None:
+                    return service
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _unified_scene_field(pattern: str, context: str, limit: int) -> str:
+        match = re.search(pattern, str(context or ""), flags=re.I)
+        return _single_line(match.group(1) if match else "", limit)
+
+    async def _run_unified_generation_engine(
+        self,
+        *,
+        workflow_kind: str,
+        request_id: str,
+        request_text: str,
+        legacy_prompt: str,
+        scene_context: str,
+        wardrobe: PhotoWardrobeDecision,
+        ambient_policy: Any,
+        reference_entries: list[tuple[Any, dict[str, Any], str]],
+        session_key: str,
+        managed_reference_gate: Any | None = None,
+        managed_reference_plan: Any | None = None,
+    ) -> Any | None:
+        config = getattr(self._image_service, "config", {}) or {}
+        rollout = parse_rollout_config(config if isinstance(config, dict) else {})
+        if not rollout.engine_enabled:
+            return None
+        registry, validation = build_route_registry(config)
+        if not validation.ok:
+            logger.warning("[ImageCompanion] 统一生图路线配置无效: %s", "; ".join(validation.errors))
+            return None
+        operation = str(workflow_kind or "selfie").strip().lower()
+        operation = {
+            "自拍": "selfie", "人像": "portrait", "改图": "edit", "修图": "edit",
+            "重绘": "edit", "p图": "edit", "文生图": "text2img",
+        }.get(operation, operation)
+        candidates = [route for route in registry.list() if route.enabled and route.key.operation == operation]
+        candidates = [
+            route for route in candidates
+            if route.key.model_profile != "anima" or operation in rollout.anima_scopes
+        ]
+        if not candidates:
+            return None
+        route = candidates[0]
+        if managed_reference_plan is not None and route.key.backend != "comfyui":
+            return None
+
+        adapters: dict[str, Any] = {}
+        comfy_service = self._get_comfyui_public_service()
+        if comfy_service is not None:
+            async def materialize(url: str, _request_id: str) -> str:
+                outcome = self._coerce_external_photo_generation_outcome(
+                    await self._download_external_image_url(url, session_key=session_key)
+                )
+                return outcome.image_path
+
+            allowed_roots = list(rollout.allowed_reference_roots)
+            if self._photo_reference_catalog_from_image_service:
+                service_data_dir = str(
+                    getattr(self._image_service, "data_dir", "") or ""
+                ).strip()
+                if service_data_dir:
+                    reference_cache_root = str(
+                        Path(service_data_dir) / "photo_reference_images"
+                    )
+                    if reference_cache_root not in allowed_roots:
+                        allowed_roots.append(reference_cache_root)
+            if managed_reference_gate is not None:
+                managed_root = str(getattr(managed_reference_gate, "root", "") or "").strip()
+                if managed_root and managed_root not in allowed_roots:
+                    allowed_roots.append(managed_root)
+            adapters["comfyui"] = ComfyUIServiceAdapter(
+                comfy_service,
+                allowed_reference_roots=tuple(allowed_roots),
+                materialize=materialize,
+            )
+
+        endpoints = self._external_image_api_endpoint_queue(include_incomplete=False)
+        endpoint_map: dict[str, dict[str, Any]] = {}
+        for index, endpoint in enumerate(endpoints):
+            endpoint_id = _single_line(endpoint.get("name") or endpoint.get("id"), 80) or f"endpoint-{index + 1}"
+            endpoint_map[endpoint_id] = endpoint
+
+        async def execute_endpoint(endpoint: dict[str, Any], prompt: Any, references: tuple[Any, ...]) -> dict[str, Any]:
+            submitted_prompt = str(prompt.positive_prompt or "").strip()
+            if prompt.negative_prompt:
+                submitted_prompt = f"{submitted_prompt}\n\nNegative prompt: {prompt.negative_prompt}".strip()
+            paths = tuple(item.path for item in references)
+            outcome = self._coerce_external_photo_generation_outcome(
+                await self._run_external_photo_generation_with_endpoint(
+                    endpoint,
+                    submitted_prompt,
+                    session_key=session_key,
+                    reference_image_path=paths[0] if paths else "",
+                    reference_image_paths=paths,
+                )
+            )
+            return {
+                "image_path": outcome.image_path,
+                "note": outcome.note,
+                "generation_completed": outcome.generation_completed,
+                "failure_stage": outcome.failure_stage,
+                "error_code": "" if outcome.image_path else (
+                    "result_materialization_failed" if outcome.failure_stage == "result_materialization" else "submission_failed"
+                ),
+            }
+
+        if endpoint_map:
+            adapters["external"] = OnlineEndpointAdapter(endpoint_map, execute_endpoint)
+
+        temperature = extract_temperature_facts(scene_context)
+        local_time = self._unified_scene_field(r"时间[：:]\s*(?:\d{4}-\d{2}-\d{2}\s+)?(\d{1,2}:\d{2})", scene_context, 12)
+        daypart = self._unified_scene_field(r"时间[：:][^；;]*[（(]([^）)]+)", scene_context, 32)
+        location = self._unified_scene_field(r"当前位置[：:]\s*([^；;]+)", scene_context, 160)
+        activity = self._unified_scene_field(r"当前日程[：:]\s*([^；;]+)", scene_context, 240)
+        sleep_phase = "preparing_for_sleep" if wardrobe.category == "sleepwear" else "awake"
+        required = tuple(dict.fromkeys((wardrobe.category, *(getattr(ambient_policy, "required", ()) or ()))))
+        forbidden_values = [
+            *(getattr(ambient_policy, "forbidden", ()) or ()),
+            wardrobe.negative_instruction,
+        ]
+        if operation in {"selfie", "portrait"}:
+            forbidden_values.extend(SELFIE_UI_NEGATIVE_TERMS)
+        forbidden = tuple(dict.fromkeys(item for item in forbidden_values if item))
+        references: list[ReferenceBindingV1] = []
+        for binding, candidate, path in reference_entries:
+            roles = []
+            for role_name in tuple(getattr(binding, "roles", ()) or ()):
+                normalized_role = "edit_source" if role_name in {"source", "edit"} else str(role_name)
+                if normalized_role in {"identity", "outfit", "pose", "style", "background", "control", "edit_source", "mask", "relationship_role", "continuity"}:
+                    roles.append(normalized_role)
+            if not roles:
+                roles = ["identity"]
+            try:
+                references.append(ReferenceBindingV1(
+                    reference_id=_single_line(getattr(binding, "reference_id", ""), 120) or _single_line(candidate.get("id"), 120) or f"ref-{len(references) + 1}",
+                    path=path,
+                    roles=tuple(dict.fromkeys(roles)),
+                    priority=_safe_int(getattr(binding, "priority", 0), 0),
+                    preserve_clothing="outfit" in roles,
+                    source=_single_line(candidate.get("kind"), 80) or "catalog",
+                ))
+            except Exception:
+                continue
+        if managed_reference_plan is not None and managed_reference_gate is not None:
+            managed_assets = tuple(getattr(managed_reference_plan, "assets", ()) or ())
+            if rollout.shadow_mode:
+                managed_paths = [str(getattr(item, "path", "") or "") for item in managed_assets]
+                managed_status = "shadow_projection"
+            else:
+                ticket = managed_reference_gate.issue(managed_reference_plan, backend="comfyui")
+                if ticket is None:
+                    managed_paths, managed_status = [], "ticket_not_issued"
+                else:
+                    managed_paths, managed_status = managed_reference_gate.consume(
+                        ticket,
+                        generation_id=request_id,
+                        backend="comfyui",
+                        capacity=len(managed_assets),
+                    )
+            if len(managed_paths) != len(managed_assets):
+                return GenerationResultV1(
+                    request_id=request_id,
+                    backend="comfyui",
+                    model_profile=route.key.model_profile,
+                    workflow=route.key.workflow,
+                    error_code="capability_missing",
+                    failure_stage="reference_plan",
+                    note=f"managed reference gate rejected the request: {managed_status}",
+                )
+            for asset, path in zip(managed_assets, managed_paths):
+                raw_role = str(getattr(asset, "role", "") or "")
+                role = "background" if raw_role == "scene" else raw_role
+                references.append(ReferenceBindingV1(
+                    reference_id=str(getattr(asset, "asset_id", "") or ""),
+                    path=path,
+                    roles=(role,),
+                    priority=100,
+                    preserve_clothing=role == "outfit",
+                    source="managed_reference_gate",
+                ))
+        structured_scene = None
+        snapshot_builder = getattr(self, "_build_companion_scene_snapshot", None)
+        if callable(snapshot_builder):
+            try:
+                snapshot = snapshot_builder()
+                if isinstance(snapshot, dict) and int(snapshot.get("version", 0) or 0) >= 3:
+                    structured_scene = SceneContextV1.from_companion_snapshot(snapshot)
+            except Exception:
+                structured_scene = None
+        spec = GenerationSpecV1(
+            schema_version=1,
+            request_id=request_id,
+            operation=operation,
+            user_request=request_text,
+            scene=structured_scene or SceneContextV1(
+                captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                local_time=local_time,
+                time_phase=daypart or "unknown",
+                location_text=location,
+                location_type="home" if re.search(r"家|卧室|客厅|home|bedroom", location, flags=re.I) else "unknown",
+                indoor=True if re.search(r"家|室内|卧室|客厅|home|indoor", location, flags=re.I) else None,
+                current_activity=activity,
+                sleep_phase=sleep_phase,
+                weather=WeatherFactsV1(
+                    temperature_c=temperature.temperature_c,
+                    feels_like_c=temperature.feels_like_c,
+                    condition=self._unified_scene_field(r"天气背景[：:]\s*([^；;]+)", scene_context, 120),
+                    source="companion_scene_context",
+                ),
+                source="image_companion_runtime",
+            ),
+            character=CharacterIdentitySpecV1(
+                name=_single_line(getattr(self, "bot_name", ""), 80),
+                appearance=character_identity_appearance_from_persona(
+                    str(getattr(self, "schedule_persona_prompt", "") or ""),
+                    str(getattr(self, "private_image_self_recognition_hint", "") or ""),
+                ),
+                default_style=_single_line(getattr(self, "photo_generation_style", ""), 80),
+            ),
+            wardrobe=WardrobeSpecV1(
+                category=wardrobe.category or "daily_outfit",
+                required=tuple(item for item in required if item),
+                forbidden=tuple(item for item in forbidden if item),
+                thermal_level=getattr(ambient_policy, "thermal_level", "unknown"),
+                source=wardrobe.source or "policy",
+                user_override=wardrobe.source == "user_prompt",
+                lock_outfit=wardrobe.lock_outfit,
+            ),
+            references=tuple(references),
+            composition=CompositionSpecV1(
+                shot=FRONT_FACING_CAMERA_PORTRAIT if operation in {"selfie", "portrait"} else operation,
+                location=location,
+                instructions=(activity,) if activity else (),
+            ),
+            legacy_prompt=legacy_prompt,
+        )
+        metrics = getattr(self._image_service, "generation_metrics", None)
+        if metrics is None:
+            metrics = GenerationMetrics()
+            setattr(self._image_service, "generation_metrics", metrics)
+        prompt_cache = getattr(self._image_service, "unified_generation_prompt_cache", None)
+        if not isinstance(prompt_cache, dict):
+            prompt_cache = {}
+            setattr(self._image_service, "unified_generation_prompt_cache", prompt_cache)
+        circuit_breaker = getattr(self._image_service, "unified_generation_circuit_breaker", None)
+        if not isinstance(circuit_breaker, CircuitBreaker):
+            circuit_breaker = CircuitBreaker()
+            setattr(self._image_service, "unified_generation_circuit_breaker", circuit_breaker)
+        route_semaphores = getattr(self._image_service, "unified_generation_route_semaphores", None)
+        if not isinstance(route_semaphores, dict):
+            route_semaphores = {}
+            setattr(self._image_service, "unified_generation_route_semaphores", route_semaphores)
+        engine = GenerationEngine(
+            default_model_profile_registry(),
+            registry,
+            adapters,
+            enabled=True,
+            shadow_mode=rollout.shadow_mode,
+            output_validator=validate_output_image if rollout.output_validation else None,
+            metrics=metrics,
+            prompt_cache=prompt_cache,
+            circuit_breaker=circuit_breaker,
+            route_semaphores=route_semaphores,
+        )
+        return await engine.generate(spec, route.name)
 
     def _extract_action_image_path(self, action_context: str) -> str:
         text = str(action_context or "")
