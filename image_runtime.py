@@ -13068,7 +13068,12 @@ Output:
             return ""
         candidates = [Path(raw).expanduser()]
         if not candidates[0].is_absolute():
-            candidates.append(Path(self.data_dir) / raw)
+            reference_data_dir = getattr(
+                self,
+                "_photo_reference_config_data_dir",
+                self.data_dir,
+            )
+            candidates.append(Path(reference_data_dir) / raw)
         for candidate in candidates:
             try:
                 path = candidate.resolve()
@@ -13294,7 +13299,12 @@ Output:
             return ""
         candidates = [Path(raw).expanduser()]
         if not candidates[0].is_absolute():
-            candidates.append(Path(self.data_dir) / raw)
+            reference_data_dir = getattr(
+                self,
+                "_photo_reference_config_data_dir",
+                self.data_dir,
+            )
+            candidates.append(Path(reference_data_dir) / raw)
         for candidate in candidates:
             try:
                 path = candidate.resolve()
@@ -13389,6 +13399,15 @@ Output:
                     logger.info(
                         "[PrivateCompanion] 配置页人设参考图 URL 已下载但配置保存返回失败: path=%s",
                         _single_line(stable_path, 160),
+                    )
+                elif catalog is None:
+                    self.photo_persona_reference_image_path = stable_path
+                else:
+                    self.photo_reference_catalog = tuple(
+                        replace(item, source=stable_path)
+                        if isinstance(item, PhotoReference) and item.kind == "persona"
+                        else item
+                        for item in catalog
                     )
             except Exception as exc:
                 logger.info("[PrivateCompanion] 配置页人设参考图 URL 已下载但回写失败: %s path=%s", _single_line(exc, 120), _single_line(stable_path, 160))
@@ -13703,6 +13722,10 @@ Output:
                         result = await result
                     if result is False:
                         logger.info("[PrivateCompanion] 参考图库远程图片已下载但配置保存返回失败")
+                    elif canonical_mode:
+                        self.photo_reference_catalog = tuple(updated_catalog)
+                    else:
+                        self.photo_reference_library = payload
                 except Exception as exc:
                     logger.info(
                         "[PrivateCompanion] 参考图库远程图片已下载但回写失败: %s",
@@ -21667,8 +21690,76 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
             if bool(getattr(service, "reuse_private_companion_assets", True)) and legacy_data_dir
             else service_data_dir or legacy_data_dir
         )
+        self._photo_reference_config_data_dir = (
+            service_data_dir
+            if catalog_from_service and service_data_dir
+            else self.data_dir
+        )
+        if catalog_from_service:
+            self._photo_reference_source_to_stable_path = (
+                self._cache_image_service_reference_source
+            )
         self._data_lock = service.image_data_lock
         self._external_image_api_runtime_lock = asyncio.Lock()
+
+    async def _cache_image_service_reference_source(
+        self,
+        source: str,
+        *,
+        stem: str = "reference",
+        event: Any = None,
+        trusted: bool = True,
+    ) -> str:
+        text = str(source or "").strip()
+        if not re.match(r"^https?://", text, flags=re.I):
+            return ""
+        owner = object.__getattribute__(self, "_image_owner")
+        downloader = getattr(owner, "_persist_private_remote_image_source", None)
+        if not callable(downloader):
+            return ""
+        service = object.__getattribute__(self, "_image_service")
+        service_data_dir = str(getattr(service, "data_dir", "") or "").strip()
+        if not service_data_dir:
+            return ""
+        target_dir = Path(service_data_dir) / "photo_reference_images"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(stem or "reference")).strip("._")
+        safe_stem = safe_stem or "reference"
+        try:
+            try:
+                downloaded = await downloader(
+                    text,
+                    target_dir,
+                    f"{safe_stem}_remote",
+                    public_hosts_only=not trusted,
+                )
+            except TypeError:
+                if not trusted:
+                    return ""
+                downloaded = await downloader(
+                    text,
+                    target_dir,
+                    f"{safe_stem}_remote",
+                )
+            path = Path(str(downloaded or "")).resolve()
+            if (
+                not path.is_file()
+                or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}
+            ):
+                return ""
+            try:
+                path.relative_to(target_dir.resolve())
+            except ValueError:
+                target = target_dir / f"{safe_stem}_{uuid.uuid4().hex[:8]}{path.suffix.lower()}"
+                shutil.copy2(path, target)
+                path = target.resolve()
+            return str(path)
+        except Exception as exc:
+            logger.info(
+                "[ImageCompanion] 独立参考图缓存失败: error_type=%s",
+                type(exc).__name__,
+            )
+            return ""
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
