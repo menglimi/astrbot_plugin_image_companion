@@ -7,7 +7,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TESTS_ROOT = ROOT / "tests"
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(TESTS_ROOT))
 
 from generation_adapters import (  # noqa: E402
     ComfyUIServiceAdapter,
@@ -159,18 +161,15 @@ class ComfyUIAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_path_boundary_and_output_signature(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside_directory:
             root = Path(directory)
             image = root / "image.png"
             image.write_bytes(b"\x89PNG\r\n\x1a\ncontent")
             self.assertTrue(path_within_roots(str(image), (directory,)))
             self.assertEqual((True, "ok"), validate_output_image(str(image)))
-            outside = Path("/tmp") / "not-inside-this-root.png"
+            outside = Path(outside_directory) / "not-inside-this-root.png"
             outside.write_bytes(b"\x89PNG\r\n\x1a\ncontent")
-            try:
-                self.assertFalse(path_within_roots(str(outside), (directory,)))
-            finally:
-                outside.unlink(missing_ok=True)
+            self.assertFalse(path_within_roots(str(outside), (directory,)))
 
 
 if __name__ == "__main__":

@@ -180,6 +180,22 @@ class ContractAndCompilerTests(unittest.TestCase):
         different_request = replace(spec, user_request="换成礼服")
         self.assertNotEqual(route_cache_key(spec, first), route_cache_key(different_request, first))
 
+    def test_route_cache_tracks_prompt_semantics_but_not_request_id(self):
+        spec = _spec()
+        route = RouteDefinition("anima", RouteKey("comfyui", "anima", "selfie", "wf"))
+        same_semantics = replace(spec, request_id="another-id")
+        changed_wardrobe = replace(
+            spec,
+            wardrobe=replace(spec.wardrobe, required=("light summer dress",)),
+        )
+        changed_scene = replace(
+            spec,
+            composition=replace(spec.composition, location="sunlit kitchen"),
+        )
+        self.assertEqual(route_cache_key(spec, route), route_cache_key(same_semantics, route))
+        self.assertNotEqual(route_cache_key(spec, route), route_cache_key(changed_wardrobe, route))
+        self.assertNotEqual(route_cache_key(spec, route), route_cache_key(changed_scene, route))
+
     def test_companion_snapshot_maps_to_versioned_scene(self):
         scene = SceneContextV1.from_companion_snapshot({
             "version": 3,
@@ -197,6 +213,69 @@ class ContractAndCompilerTests(unittest.TestCase):
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_context_is_returned_as_classified_failure(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie", "wf")))
+        invalid = replace(_spec(), operation="unsupported")
+        result = await GenerationEngine(default_model_profile_registry(), routes, {}).generate(invalid, "route")
+        self.assertEqual("context_invalid", result.error_code)
+        self.assertEqual("context", result.failure_stage)
+
+    async def test_capability_probe_failure_uses_fallback(self):
+        class BrokenAdapter(_Adapter):
+            async def capabilities(self, route):
+                raise RuntimeError("probe failed")
+
+        routes = RouteRegistry()
+        routes.register(RouteDefinition(
+            "broken",
+            RouteKey("comfyui", "anima", "selfie", "wf"),
+            fallback_routes=("legacy",),
+        ))
+        routes.register(RouteDefinition("legacy", RouteKey("legacy", "legacy", "selfie")))
+        adapter = BrokenAdapter("comfyui")
+        legacy = _Adapter("legacy")
+        result = await GenerationEngine(
+            default_model_profile_registry(), routes, {"comfyui": adapter, "legacy": legacy}
+        ).generate(_spec(), "broken")
+        self.assertTrue(result.ok)
+        self.assertEqual("legacy", result.backend)
+
+    async def test_route_concurrency_limit_is_shared_between_engines(self):
+        class SlowAdapter(_Adapter):
+            active = 0
+            peak = 0
+
+            async def generate(self, route, spec, prompt, references, trace):
+                type(self).active += 1
+                type(self).peak = max(type(self).peak, type(self).active)
+                await asyncio.sleep(0.01)
+                type(self).active -= 1
+                return await super().generate(route, spec, prompt, references, trace)
+
+        routes = RouteRegistry()
+        routes.register(RouteDefinition(
+            "limited",
+            RouteKey("comfyui", "anima", "selfie", "wf"),
+            concurrency_limit=1,
+        ))
+        shared_semaphores = {}
+        first = SlowAdapter("comfyui")
+        second = SlowAdapter("comfyui")
+        engines = [
+            GenerationEngine(
+                default_model_profile_registry(), routes, {"comfyui": adapter},
+                route_semaphores=shared_semaphores,
+            )
+            for adapter in (first, second)
+        ]
+        results = await asyncio.gather(
+            engines[0].generate(_spec(request_id="one"), "limited"),
+            engines[1].generate(_spec(request_id="two"), "limited"),
+        )
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(1, SlowAdapter.peak)
+
     async def test_prompt_cache_can_be_shared_across_request_scoped_engines(self):
         routes = RouteRegistry()
         routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie", "wf")))

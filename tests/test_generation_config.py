@@ -44,7 +44,10 @@ class GenerationConfigTests(unittest.TestCase):
                         "paid": True,
                     },
                 ]
-            }
+            },
+            "image": {"external_image_api_endpoints": [{
+                "name": "endpoint-1", "platform": "openai", "model": "gpt-image-1",
+            }]},
         }
         registry, result = build_route_registry(config)
         self.assertTrue(result.ok)
@@ -126,6 +129,12 @@ class GenerationConfigTests(unittest.TestCase):
             "workflow": "nai-endpoint",
         }
         self.assertTrue(active_engine_claims_profile({
+            "engine": {"mode": "active", "routes": [route]},
+            "image": {"external_image_api_endpoints": [{
+                "name": "nai-endpoint", "platform": "novelai", "model": "nai-v4",
+            }]},
+        }, "nai"))
+        self.assertFalse(active_engine_claims_profile({
             "engine": {"mode": "active", "routes": [route]},
         }, "nai"))
         self.assertFalse(active_engine_claims_profile({

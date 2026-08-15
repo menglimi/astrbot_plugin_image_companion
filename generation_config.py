@@ -54,6 +54,18 @@ def _list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
+def _canonical_model_profile(value: Any) -> str:
+    aliases = {
+        "natural_language": "generic_natural",
+        "traditional": "generic_tags",
+        "novelai": "nai",
+        "legacy_traditional": "legacy",
+        "legacy_natural": "legacy",
+    }
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return aliases.get(normalized, normalized)
+
+
 def parse_rollout_config(config: Mapping[str, Any]) -> RolloutConfig:
     engine = _mapping(config.get("engine"))
     mode = str(engine.get("mode") or "legacy").strip().lower()
@@ -79,6 +91,13 @@ def parse_rollout_config(config: Mapping[str, Any]) -> RolloutConfig:
 def build_route_registry(config: Mapping[str, Any]) -> tuple[RouteRegistry, ConfigValidation]:
     engine = _mapping(config.get("engine"))
     rows = _list(engine.get("routes"))
+    image = _mapping(config.get("image"))
+    endpoint_rows = _list(image.get("external_image_api_endpoints"))
+    endpoint_map = {
+        str(item.get("name") or item.get("id") or "").strip(): item
+        for item in endpoint_rows
+        if isinstance(item, Mapping) and str(item.get("name") or item.get("id") or "").strip()
+    }
     mapping_rows = _list(engine.get("workflow_mappings"))
     workflow_mappings: dict[str, Mapping[str, Any]] = {}
     for raw_mapping in mapping_rows:
@@ -120,6 +139,14 @@ def build_route_registry(config: Mapping[str, Any]) -> tuple[RouteRegistry, Conf
             errors.append(f"route {name!r} has unsupported operation {operation!r}")
         if backend in {"comfyui", "external"} and not workflow:
             errors.append(f"route {name!r} requires workflow/endpoint id")
+        if backend == "external" and workflow:
+            endpoint = endpoint_map.get(workflow)
+            if endpoint is None:
+                errors.append(f"route {name!r} refers to missing external endpoint {workflow!r}")
+            elif _canonical_model_profile(endpoint_model_profile(endpoint)) != _canonical_model_profile(profile):
+                errors.append(
+                    f"route {name!r} model profile {profile!r} does not match endpoint {workflow!r}"
+                )
         paid = bool(raw.get("paid", backend == "external"))
         allow_paid = bool(raw.get("allow_paid_fallback", False))
         fallbacks = tuple(str(item).strip() for item in _list(raw.get("fallback_routes")) if str(item).strip())

@@ -9,15 +9,29 @@ from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-COMFY_ROOT = ROOT.parent / "comfyui-plugin"
+TESTS_ROOT = ROOT / "tests"
+COMFY_CANDIDATES = (
+    ROOT.parent / "comfyui-plugin",
+    ROOT.parent / "astrbot_plugin_comfyui",
+)
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(COMFY_ROOT))
+sys.path.insert(0, str(TESTS_ROOT))
 
 from generation_adapters import ComfyUIServiceAdapter  # noqa: E402
 from generation_engine import GenerationEngine, RouteDefinition, RouteKey, RouteRegistry, route_cache_key  # noqa: E402
 from generation_profiles import default_model_profile_registry  # noqa: E402
-from public_service import ComfyUIPublicService  # noqa: E402
 from test_generation_engine import _spec  # noqa: E402
+
+ComfyUIPublicService = None
+for candidate in COMFY_CANDIDATES:
+    if not (candidate / "public_service.py").is_file():
+        continue
+    sys.path.insert(0, str(candidate))
+    try:
+        from public_service import ComfyUIPublicService  # type: ignore[assignment]  # noqa: E402
+    except ImportError:
+        continue
+    break
 
 
 class _Transport:
@@ -36,6 +50,7 @@ class _Transport:
 
 
 class UnifiedGenerationEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipIf(ComfyUIPublicService is None, "ComfyUI public service checkout is unavailable")
     async def test_companion_spec_to_anima_workflow_named_slots(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

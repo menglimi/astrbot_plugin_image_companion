@@ -2,9 +2,11 @@
 """Backend-isolated generation router with recompiling fallback semantics."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 try:
@@ -170,21 +172,21 @@ def route_cache_key(
     workflow_fingerprint: str = "",
     mapping_version: int = 0,
 ) -> str:
-    weather = spec.scene.weather
-    raw = "|".join(
-        (
-            spec.character.character_id,
-            spec.scene.time_phase,
-            spec.scene.location_type,
-            weather.thermal_level,
-            spec.wardrobe.category,
-            hashlib.sha256(spec.user_request.encode("utf-8", "ignore")).hexdigest(),
-            hashlib.sha256("|".join((*spec.required_concepts, *spec.forbidden_concepts)).encode("utf-8", "ignore")).hexdigest(),
-            route.key.value(),
-            workflow_fingerprint,
-            str(mapping_version),
-        )
-    )
+    semantic_spec = {
+        "operation": spec.operation,
+        "user_request": spec.user_request,
+        "scene": asdict(spec.scene),
+        "character": asdict(spec.character),
+        "wardrobe": asdict(spec.wardrobe),
+        "composition": asdict(spec.composition),
+        "required_concepts": spec.required_concepts,
+        "forbidden_concepts": spec.forbidden_concepts,
+        "legacy_prompt": spec.legacy_prompt,
+        "route": route.key.value(),
+        "workflow_fingerprint": workflow_fingerprint,
+        "mapping_version": mapping_version,
+    }
+    raw = json.dumps(semantic_spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -202,6 +204,8 @@ class GenerationEngine:
         output_validator: Callable[[str], tuple[bool, str]] | None = None,
         metrics: Any = None,
         prompt_cache: dict[str, PromptPackageV1] | None = None,
+        prompt_cache_limit: int = 256,
+        route_semaphores: dict[str, asyncio.Semaphore] | None = None,
     ) -> None:
         self.profiles = profiles
         self.routes = routes
@@ -213,6 +217,8 @@ class GenerationEngine:
         self.output_validator = output_validator
         self.metrics = metrics
         self._prompt_cache = prompt_cache if prompt_cache is not None else {}
+        self._prompt_cache_limit = max(1, int(prompt_cache_limit))
+        self._route_semaphores = route_semaphores if route_semaphores is not None else {}
 
     @staticmethod
     def _event(stage: str, **data: Any) -> dict[str, Any]:
@@ -220,17 +226,34 @@ class GenerationEngine:
 
     async def generate(self, spec: GenerationSpecV1, route_name: str) -> GenerationResultV1:
         started = time.monotonic()
-        spec.validate()
         trace: list[dict[str, Any]] = [self._event("context", request_id=spec.request_id)]
+        try:
+            spec.validate()
+        except Exception as exc:
+            result = GenerationResultV1(
+                request_id=spec.request_id,
+                error_code="context_invalid",
+                failure_stage="context",
+                note=f"{type(exc).__name__}: {exc}",
+                trace=tuple(trace),
+            )
+            self._record_metrics(route_name, result, started)
+            return result
         if not self.enabled:
-            return GenerationResultV1(
+            result = GenerationResultV1(
                 request_id=spec.request_id,
                 error_code="route_unavailable",
                 failure_stage="route",
                 note="generation engine disabled",
                 trace=tuple(trace),
             )
+            self._record_metrics(route_name, result, started)
+            return result
         result = await self._attempt(spec, route_name, trace, visited=())
+        self._record_metrics(route_name, result, started)
+        return result
+
+    def _record_metrics(self, route_name: str, result: GenerationResultV1, started: float) -> None:
         if self.metrics is not None and callable(getattr(self.metrics, "record", None)):
             self.metrics.record(
                 route=route_name,
@@ -238,7 +261,24 @@ class GenerationEngine:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 error_code=result.error_code,
             )
-        return result
+
+    def _cache_prompt(self, key: str, prompt: PromptPackageV1) -> None:
+        if key in self._prompt_cache:
+            self._prompt_cache.pop(key, None)
+        while len(self._prompt_cache) >= self._prompt_cache_limit:
+            oldest = next(iter(self._prompt_cache), None)
+            if oldest is None:
+                break
+            self._prompt_cache.pop(oldest, None)
+        self._prompt_cache[key] = prompt
+
+    def _route_semaphore(self, route: RouteDefinition) -> asyncio.Semaphore:
+        key = f"{route.name}:{max(1, int(route.concurrency_limit))}"
+        semaphore = self._route_semaphores.get(key)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(max(1, int(route.concurrency_limit)))
+            self._route_semaphores[key] = semaphore
+        return semaphore
 
     async def _attempt(
         self,
@@ -292,7 +332,7 @@ class GenerationEngine:
                 compiler = self.profiles.get(route.key.model_profile)
                 prompt = compiler.compile(spec)
                 prompt.validate()
-                self._prompt_cache[cache_key] = prompt
+                self._cache_prompt(cache_key, prompt)
         except Exception as exc:
             result = GenerationResultV1(
                 request_id=spec.request_id,
@@ -313,13 +353,27 @@ class GenerationEngine:
                 negative_hash=hashlib.sha256(prompt.negative_prompt.encode()).hexdigest(),
             )
         )
-        capabilities = route.capabilities_override or await adapter.capabilities(route)
-        required_roles = tuple(
-            dict.fromkeys(role for reference in spec.references for role in reference.roles if role == "edit_source")
-        )
-        reference_plan = self.reference_planner.plan(
-            spec.references, capabilities, required_roles=required_roles
-        )
+        try:
+            capabilities = route.capabilities_override or await adapter.capabilities(route)
+            capabilities.validate()
+            required_roles = tuple(
+                dict.fromkeys(role for reference in spec.references for role in reference.roles if role == "edit_source")
+            )
+            reference_plan = self.reference_planner.plan(
+                spec.references, capabilities, required_roles=required_roles
+            )
+        except Exception as exc:
+            result = GenerationResultV1(
+                request_id=spec.request_id,
+                backend=route.key.backend,
+                model_profile=route.key.model_profile,
+                workflow=route.key.workflow,
+                error_code="capability_missing",
+                failure_stage="capability",
+                note=f"{type(exc).__name__}: {exc}",
+                trace=tuple(trace),
+            )
+            return await self._fallback(spec, route, result, trace, (*visited, route_name))
         trace.append(
             self._event(
                 "reference_plan",
@@ -353,7 +407,8 @@ class GenerationEngine:
                 trace=tuple((*trace, self._event("shadow", route=route.name))),
             )
         try:
-            result = await adapter.generate(route, spec, prompt, reference_plan, trace)
+            async with self._route_semaphore(route):
+                result = await adapter.generate(route, spec, prompt, reference_plan, trace)
         except TimeoutError as exc:
             result = GenerationResultV1(
                 request_id=spec.request_id,

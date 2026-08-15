@@ -7460,43 +7460,6 @@ Output:
                     return plugin
             except Exception:
                 continue
-        if managed_reference_plan is not None and managed_reference_gate is not None:
-            managed_assets = tuple(getattr(managed_reference_plan, "assets", ()) or ())
-            if rollout.shadow_mode:
-                managed_paths = [str(getattr(item, "path", "") or "") for item in managed_assets]
-                managed_status = "shadow_projection"
-            else:
-                ticket = managed_reference_gate.issue(managed_reference_plan, backend="comfyui")
-                if ticket is None:
-                    managed_paths, managed_status = [], "ticket_not_issued"
-                else:
-                    managed_paths, managed_status = managed_reference_gate.consume(
-                        ticket,
-                        generation_id=request_id,
-                        backend="comfyui",
-                        capacity=len(managed_assets),
-                    )
-            if len(managed_paths) != len(managed_assets):
-                return GenerationResultV1(
-                    request_id=request_id,
-                    backend="comfyui",
-                    model_profile=route.key.model_profile,
-                    workflow=route.key.workflow,
-                    error_code="capability_missing",
-                    failure_stage="reference_plan",
-                    note=f"managed reference gate rejected the request: {managed_status}",
-                )
-            for asset, path in zip(managed_assets, managed_paths):
-                raw_role = str(getattr(asset, "role", "") or "")
-                role = "background" if raw_role == "scene" else raw_role
-                references.append(ReferenceBindingV1(
-                    reference_id=str(getattr(asset, "asset_id", "") or ""),
-                    path=path,
-                    roles=(role,),
-                    priority=100,
-                    preserve_clothing=role == "outfit",
-                    source="managed_reference_gate",
-                ))
         for module in list(sys.modules.values()):
             try:
                 plugin = getattr(module, "_screen_companion_tool_plugin", None)
@@ -19318,6 +19281,43 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 ))
             except Exception:
                 continue
+        if managed_reference_plan is not None and managed_reference_gate is not None:
+            managed_assets = tuple(getattr(managed_reference_plan, "assets", ()) or ())
+            if rollout.shadow_mode:
+                managed_paths = [str(getattr(item, "path", "") or "") for item in managed_assets]
+                managed_status = "shadow_projection"
+            else:
+                ticket = managed_reference_gate.issue(managed_reference_plan, backend="comfyui")
+                if ticket is None:
+                    managed_paths, managed_status = [], "ticket_not_issued"
+                else:
+                    managed_paths, managed_status = managed_reference_gate.consume(
+                        ticket,
+                        generation_id=request_id,
+                        backend="comfyui",
+                        capacity=len(managed_assets),
+                    )
+            if len(managed_paths) != len(managed_assets):
+                return GenerationResultV1(
+                    request_id=request_id,
+                    backend="comfyui",
+                    model_profile=route.key.model_profile,
+                    workflow=route.key.workflow,
+                    error_code="capability_missing",
+                    failure_stage="reference_plan",
+                    note=f"managed reference gate rejected the request: {managed_status}",
+                )
+            for asset, path in zip(managed_assets, managed_paths):
+                raw_role = str(getattr(asset, "role", "") or "")
+                role = "background" if raw_role == "scene" else raw_role
+                references.append(ReferenceBindingV1(
+                    reference_id=str(getattr(asset, "asset_id", "") or ""),
+                    path=path,
+                    roles=(role,),
+                    priority=100,
+                    preserve_clothing=role == "outfit",
+                    source="managed_reference_gate",
+                ))
         structured_scene = None
         snapshot_builder = getattr(self, "_build_companion_scene_snapshot", None)
         if callable(snapshot_builder):
@@ -19386,6 +19386,10 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         if not isinstance(circuit_breaker, CircuitBreaker):
             circuit_breaker = CircuitBreaker()
             setattr(self._image_service, "unified_generation_circuit_breaker", circuit_breaker)
+        route_semaphores = getattr(self._image_service, "unified_generation_route_semaphores", None)
+        if not isinstance(route_semaphores, dict):
+            route_semaphores = {}
+            setattr(self._image_service, "unified_generation_route_semaphores", route_semaphores)
         engine = GenerationEngine(
             default_model_profile_registry(),
             registry,
@@ -19396,6 +19400,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             metrics=metrics,
             prompt_cache=prompt_cache,
             circuit_breaker=circuit_breaker,
+            route_semaphores=route_semaphores,
         )
         return await engine.generate(spec, route.name)
 
