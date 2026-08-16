@@ -21,9 +21,33 @@ from image_companion_wardrobe_testpkg.photo_prompt_context import (  # noqa: E40
     compile_local_photo_negative_prompt,
     compile_local_photo_prompt,
 )
+from image_companion_wardrobe_testpkg.generation_policy import resolve_structured_outfit  # noqa: E402
 
 
 class StructuredWardrobePromptTests(unittest.TestCase):
+    def test_abstract_sleepwear_request_expands_to_concrete_structure(self):
+        outfit = resolve_structured_outfit(
+            category="sleepwear",
+            thermal_level="hot",
+            context_key="2026-08-16T23:45+08:00",
+            request_text="准备睡了，看看睡衣",
+        )
+        tags = ", ".join(outfit.positive_tags()).lower()
+        self.assertTrue("pajama" in tags or "sleep t-shirt" in tags)
+        self.assertNotIn("看看睡衣", tags)
+        self.assertIn("short sleeves", tags)
+
+    def test_detailed_sleepwear_request_remains_explicit(self):
+        outfit = resolve_structured_outfit(
+            category="sleepwear",
+            thermal_level="hot",
+            context_key="2026-08-16T23:45+08:00",
+            request_text="蓝色棉质短袖睡衣",
+        )
+        tags = ", ".join(outfit.positive_tags())
+        self.assertIn("蓝色棉质短袖睡衣", tags)
+        self.assertIn("materials exactly as requested", tags)
+
     def test_protected_wardrobe_survives_legacy_prompt_budget(self):
         positives = ", ".join(f"garment-detail-{index}" for index in range(80))
         negatives = ", ".join(f"canonical-detail-{index}" for index in range(50))

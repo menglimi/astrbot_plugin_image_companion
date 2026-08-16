@@ -336,7 +336,22 @@ def _specific_outfit_items(request_text: str) -> tuple[str, ...]:
         r"[^,，;；。]{0,40}",
         flags=re.I,
     )
-    return tuple(dict.fromkeys(" ".join(match.group(0).split()).strip() for match in garment.finditer(text)))[:8]
+    abstract_sleepwear = re.compile(r"(?:sleepwear|nightwear|pajamas?|pyjamas?|睡衣)", flags=re.I)
+    concrete_detail = re.compile(
+        r"(?:black|white|blue|green|pink|purple|lavender|gray|grey|cream|cotton|silk|satin|linen|wool|"
+        r"short[- ]sleeve|long[- ]sleeve|sleeveless|oversized|loose|fitted|button|collar|shorts|pants|"
+        r"黑|白|蓝|绿|粉|紫|灰|米色|棉|真丝|丝绸|缎|亚麻|羊毛|短袖|长袖|无袖|宽松|修身|纽扣|领|短裤|长裤)",
+        flags=re.I,
+    )
+    items: list[str] = []
+    for match in garment.finditer(text):
+        item = " ".join(match.group(0).split()).strip()
+        # “看看睡衣 / sleepwear”仍是抽象类别，不能冒充已给出的具体服装结构。
+        if abstract_sleepwear.search(item) and not concrete_detail.search(item):
+            continue
+        if item and item not in items:
+            items.append(item)
+    return tuple(items[:8])
 
 
 def resolve_structured_outfit(
