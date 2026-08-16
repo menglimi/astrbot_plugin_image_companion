@@ -914,7 +914,11 @@ def resolve_photo_wardrobe_decision(
             positive_instruction=(
                 "An explicit clothing request in this prompt has highest priority. "
                 f"Render one coherent {_outfit_label(explicit_category)} outfit exactly as requested; "
-                "use any incompatible selected reference only for identity and compatible visual details."
+                + (
+                    "use the submitted incompatible reference only for identity and compatible visual details."
+                    if reference_path
+                    else "preserve identity without assuming that an outfit reference image exists."
+                )
             ),
             negative_instruction=" ".join(
                 part
@@ -1491,7 +1495,12 @@ def resolve_photo_wardrobe_decision(
             effective_reference_roles=effective_roles,
             positive_instruction=(
                 f"Use the compatible suggested scene preset '{suggested_preset}' as the wardrobe source because the user "
-                "and selected reference do not provide a stronger outfit requirement. Render one coherent outfit."
+                + (
+                    "and submitted reference do not provide a stronger outfit requirement. "
+                    if reference_path
+                    else "does not provide a stronger outfit requirement and no outfit reference image was submitted. "
+                )
+                + "Render one coherent outfit."
             ),
             negative_instruction="Do not restore a conflicting outfit from schedule context or today's outfit.",
             reason="compatible tool suggestion fills an otherwise unspecified wardrobe",
@@ -1554,10 +1563,18 @@ def resolve_photo_wardrobe_decision(
             reference_roles=roles,
             effective_reference_roles=effective_roles,
             positive_instruction=(
-                "The selected reference, if present, controls identity only. Since the user did not request a clothing change, "
+                (
+                    "The submitted reference controls identity only. "
+                    if reference_path
+                    else "No outfit reference image was submitted. "
+                )
+                + "Since the user did not request a clothing change, "
                 "today's outfit context may provide wardrobe continuity."
             ),
-            negative_instruction="Do not copy incidental clothing from an identity-only reference over today's outfit.",
+            negative_instruction=(
+                "Do not copy incidental clothing from an identity-only reference over today's outfit."
+                if reference_path else ""
+            ),
             reason="identity-only reference with available daily outfit context",
             excluded_categories=resolved_intent.excluded_categories,
             excluded_outfit_text=resolved_intent.exclusion_text,

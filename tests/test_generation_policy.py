@@ -8,12 +8,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from generation_policy import (  # noqa: E402
+    DEFAULT_CANONICAL_OUTFIT_NEGATIVES,
     character_identity_appearance_from_persona,
     apply_ambient_wardrobe_intent,
     extract_temperature_facts,
     infer_ambient_wardrobe_policy,
     outfit_context_fingerprint,
     hot_outfit_fields,
+    infer_outfit_mode,
+    resolve_structured_outfit,
 )
 from photo_wardrobe_decision import (  # noqa: E402
     PhotoWardrobeIntent,
@@ -70,6 +73,47 @@ class TemperatureParsingTests(unittest.TestCase):
 
 
 class AmbientWardrobeTests(unittest.TestCase):
+    def test_hot_homewear_expands_to_one_concrete_outfit(self):
+        outfit = resolve_structured_outfit(
+            category="homewear",
+            thermal_level="hot",
+            context_key="2026-08-16T09:54|home|33C",
+            request_text="来张上午居家自拍",
+        )
+        text = ", ".join(outfit.positive_tags()).lower()
+        self.assertEqual("free_outfit", outfit.mode)
+        self.assertIn("t-shirt", text)
+        self.assertIn("short sleeves", text)
+        self.assertIn("lounge shorts", text)
+        self.assertIn("slippers", text)
+        self.assertNotRegex(text, r"\bor\b")
+        self.assertIn("armored collar", outfit.forbidden_details)
+
+    def test_canonical_and_real_reference_modes_are_isolated(self):
+        self.assertEqual("canonical_outfit", infer_outfit_mode("换回官方作战服"))
+        self.assertEqual("reference_outfit", infer_outfit_mode("照这个穿搭", has_outfit_reference=True))
+        canonical = resolve_structured_outfit(
+            category="daily_outfit", thermal_level="mild", context_key="canonical",
+            request_text="换回官方作战服",
+        )
+        self.assertEqual((), canonical.forbidden_details)
+        referenced = resolve_structured_outfit(
+            category="daily_outfit", thermal_level="mild", context_key="reference",
+            request_text="照这个穿搭", has_outfit_reference=True,
+        )
+        self.assertIn("submitted outfit reference image", " ".join(referenced.positive_tags()))
+
+    def test_explicit_outfit_is_not_mixed_with_catalog_default(self):
+        outfit = resolve_structured_outfit(
+            category="custom_outfit", thermal_level="hot", context_key="explicit",
+            request_text="oversized black pullover hoodie, blue denim shorts, bare legs, white low-top sneakers",
+        )
+        text = ", ".join(outfit.positive_tags()).lower()
+        self.assertIn("black pullover hoodie", text)
+        self.assertIn("denim shorts", text)
+        self.assertNotIn("mint green", text)
+        self.assertTrue(set(DEFAULT_CANONICAL_OUTFIT_NEGATIVES).issubset(outfit.forbidden_details))
+
     def test_late_night_home_context_selects_sleepwear(self):
         policy = infer_ambient_wardrobe_policy(
             workflow_kind="selfie",
@@ -124,6 +168,17 @@ class AmbientWardrobeTests(unittest.TestCase):
         self.assertEqual("sleepwear", decision.category)
         self.assertNotIn("outfit", decision.effective_reference_roles)
         self.assertNotIn("当天基础穿搭", decision.scene_context)
+
+    def test_no_reference_path_never_claims_selected_reference(self):
+        decision = resolve_photo_wardrobe_decision(
+            workflow_kind="selfie",
+            prompt_text="comfortable homewear",
+            intent=PhotoWardrobeIntent(target_category="homewear", target_text="comfortable homewear"),
+            reference=None,
+            available_presets=("居家服",),
+        )
+        self.assertNotIn("selected reference", decision.positive_instruction.lower())
+        self.assertIn("without assuming", decision.positive_instruction.lower())
 
 
 if __name__ == "__main__":

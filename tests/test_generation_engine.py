@@ -145,6 +145,24 @@ class ContractAndCompilerTests(unittest.TestCase):
         self.assertNotIn("wool sweater", compiled.positive_prompt)
         self.assertNotRegex(compiled.positive_prompt, r"\d+(?:\.\d+)?::|[{}\[\]]")
 
+    def test_anima_compiler_receives_structured_outfit_terms(self):
+        from generation_policy import resolve_structured_outfit
+        outfit = resolve_structured_outfit(
+            category="homewear", thermal_level="hot", context_key="09:54", request_text="居家服",
+        )
+        required = outfit.positive_tags()
+        spec = replace(_spec(), wardrobe=replace(
+            _spec().wardrobe,
+            category="homewear",
+            required=required,
+            forbidden=outfit.forbidden_details,
+            outfit=outfit,
+        ))
+        compiled = AnimaPromptCompiler().compile(spec)
+        self.assertIn("lounge shorts", compiled.positive_prompt)
+        self.assertIn("armored collar", compiled.negative_prompt)
+        self.assertNotIn("armored collar", compiled.positive_prompt)
+
     def test_selfie_ui_contract_is_added_to_anima_negative_prompt(self):
         compiled = AnimaPromptCompiler().compile(_spec())
         for term in SELFIE_UI_NEGATIVE_TERMS:

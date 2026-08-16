@@ -88,6 +88,36 @@ def parse_rollout_config(config: Mapping[str, Any]) -> RolloutConfig:
     )
 
 
+def resolve_wardrobe_profile(
+    config: Mapping[str, Any],
+    *,
+    character_id: str,
+    model_profile: str = "",
+) -> Mapping[str, Any]:
+    """Return the most specific character/model wardrobe profile, if configured."""
+    engine = _mapping(config.get("engine"))
+    rows = _list(engine.get("wardrobe_profiles"))
+    character = str(character_id or "bot").strip().lower()
+    model = str(model_profile or "").strip().lower()
+    matches: list[tuple[int, Mapping[str, Any]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        characters = {
+            str(item).strip().lower() for item in _list(row.get("character_ids")) if str(item).strip()
+        }
+        models = {
+            str(item).strip().lower() for item in _list(row.get("model_profiles")) if str(item).strip()
+        }
+        if characters and character not in characters and "*" not in characters:
+            continue
+        if models and model and model not in models and "*" not in models:
+            continue
+        score = (2 if character in characters else 0) + (1 if model and model in models else 0)
+        matches.append((score, row))
+    return dict(max(matches, key=lambda item: item[0])[1]) if matches else {}
+
+
 def build_route_registry(config: Mapping[str, Any]) -> tuple[RouteRegistry, ConfigValidation]:
     engine = _mapping(config.get("engine"))
     rows = _list(engine.get("routes"))
@@ -174,6 +204,9 @@ def build_route_registry(config: Mapping[str, Any]) -> tuple[RouteRegistry, Conf
                     or raw.get("mapping_version")
                     or 0
                 ),
+                "outfit_mode_parameters": dict(raw.get("outfit_mode_parameters"))
+                if isinstance(raw.get("outfit_mode_parameters"), Mapping)
+                else {},
             },
         )
         try:

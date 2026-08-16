@@ -50,13 +50,19 @@
         "description": "生图路线管理",
         "type": "list",
         "default": [],
-        "hint": "每项填写 name、backend、model_profile、operation、workflow；后备路线与付费回退相互隔离。新版陪伴的官方 NAI 直连默认不受影响；仅 active 且存在匹配操作的 NAI 路线时由统一引擎接管。"
+        "hint": "每项填写 name、backend、model_profile、operation、workflow；后备路线与付费回退相互隔离。可选 outfit_mode_parameters 仅在工作流已确认暴露同名参数槽时按 canonical_outfit/free_outfit/reference_outfit 设置 LoRA 等权重，缺失能力时保持工作流原值。新版陪伴的官方 NAI 直连默认不受影响；仅 active 且存在匹配操作的 NAI 路线时由统一引擎接管。"
       },
       "workflow_mappings": {
         "description": "ComfyUI 工作流映射覆盖",
         "type": "list",
         "default": [],
         "hint": "仅在自动识别不确定时填写，映射会绑定工作流内容指纹。"
+      },
+      "wardrobe_profiles": {
+        "description": "角色服装防串档案",
+        "type": "list",
+        "default": [],
+        "hint": "可按 character_ids 与 model_profiles 隔离配置 free_outfit_forbidden。留空使用通用安全词；配置后只作用于匹配角色/模型，不会把单一角色官方服装规则强加给其他角色。"
       },
       "output_validation": {
         "description": "启用输出图片核验",

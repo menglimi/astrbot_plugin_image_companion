@@ -154,6 +154,10 @@ class ComfyUIServiceAdapter:
 
     async def generate(self, route, spec, prompt, references: ReferencePlan, trace):
         inspection = self.service.inspect_workflow(route.key.workflow)
+        inspection_slots = inspection.get("slots") if isinstance(inspection.get("slots"), list) else []
+        available_slot_names = {
+            str(item.get("name")) for item in inspection_slots if isinstance(item, Mapping)
+        }
         expected_fingerprint = str(route.settings.get("workflow_fingerprint") or "").strip()
         actual_fingerprint = str(inspection.get("fingerprint") or "").strip()
         if expected_fingerprint and expected_fingerprint != actual_fingerprint:
@@ -171,6 +175,40 @@ class ComfyUIServiceAdapter:
         slots: dict[str, Any] = {"positive_prompt": prompt.positive_prompt}
         if prompt.negative_prompt and capabilities.negative_prompt:
             slots["negative_prompt"] = prompt.negative_prompt
+        outfit = getattr(spec.wardrobe, "outfit", None)
+        outfit_mode = str(getattr(outfit, "mode", "") or "")
+        mode_parameters = route.settings.get("outfit_mode_parameters")
+        selected_parameters = (
+            mode_parameters.get(outfit_mode)
+            if isinstance(mode_parameters, Mapping) and isinstance(mode_parameters.get(outfit_mode), Mapping)
+            else {}
+        )
+        allowed_parameters = {
+            "lora_strength", "lora_clip_strength", "ipadapter_weight", "face_strength", "control_strength",
+        }
+        applied_parameters: dict[str, float] = {}
+        for name, raw_value in selected_parameters.items():
+            parameter = str(name or "").strip()
+            if parameter not in allowed_parameters or parameter not in available_slot_names:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= value <= 2:
+                continue
+            slots[parameter] = value
+            applied_parameters[parameter] = value
+        if selected_parameters:
+            trace.append({
+                "stage": "outfit_mode_parameters",
+                "at": time.time(),
+                "data": {
+                    "mode": outfit_mode,
+                    "requested": sorted(str(name) for name in selected_parameters),
+                    "applied": applied_parameters,
+                },
+            })
         role_names = {
             "identity": "identity_image", "outfit": "outfit_image",
             "background": "background_image", "style": "style_image", "control": "control_image",

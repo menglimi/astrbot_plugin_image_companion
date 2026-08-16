@@ -19,6 +19,7 @@ _SECTION_SOURCES = frozenset(
         "fixed_prompt",
         "recent_continuity",
         "wardrobe_decision",
+        "wardrobe_structure",
         "managed_reference",
         "reference_fallback",
         "composition",
@@ -693,7 +694,7 @@ def _assemble(sections: Sequence[PhotoPromptSection], prompt_format: str) -> str
         ),
         (
             "Reference and wardrobe ruling",
-            _join_field(sections, frozenset({"wardrobe_decision", "reference_fallback"})),
+            _join_field(sections, frozenset({"wardrobe_decision", "wardrobe_structure", "reference_fallback"})),
         ),
         (
             "Scene, style and final preset",
@@ -739,6 +740,7 @@ _LOCAL_VISUAL_PROMPT_SOURCES = frozenset(
         "scene_context",
         "preset",
         "fixed_prompt",
+        "wardrobe_structure",
         "composition",
     }
 )
@@ -772,6 +774,8 @@ def _local_visual_section_text(section: PhotoPromptSection) -> str:
         text = re.sub(r"^\s*scene\s+preset\s*:\s*", "", text, flags=re.I)
     elif section.source == "fixed_prompt":
         text = re.sub(r"^\s*additional\s+(?:fixed\s+prompt|outfit\s+preference)\s*:\s*", "", text, flags=re.I)
+    elif section.source == "wardrobe_structure":
+        text = re.sub(r"^\s*concrete\s+wardrobe\s+specification\s*:\s*", "", text, flags=re.I)
     elif section.source == "composition":
         lower_name = str(section.name or "").strip().lower()
         if lower_name == "relationship_role_reference":
