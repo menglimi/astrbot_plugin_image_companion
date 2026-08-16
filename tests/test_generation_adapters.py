@@ -4,6 +4,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,7 @@ from generation_adapters import (  # noqa: E402
 from generation_engine import ReferencePlan, RouteDefinition, RouteKey  # noqa: E402
 from generation_profiles import AnimaPromptCompiler  # noqa: E402
 from test_generation_engine import _spec  # noqa: E402
+from generation_policy import resolve_structured_outfit  # noqa: E402
 
 
 class _Service:
@@ -39,6 +41,7 @@ class _Service:
                 {"name": "identity_image"},
                 {"name": "seed"},
                 {"name": "image_output"},
+                {"name": "lora_strength"},
             ]
         }
 
@@ -86,6 +89,24 @@ class EndpointProfileTests(unittest.TestCase):
 
 
 class ComfyUIAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outfit_mode_lora_parameter_is_capability_gated(self):
+        service = _Service()
+        outfit = resolve_structured_outfit(
+            category="homewear", thermal_level="hot", context_key="mode", request_text="居家服",
+        )
+        spec = replace(_spec(), wardrobe=replace(_spec().wardrobe, outfit=outfit))
+        route = RouteDefinition(
+            "anima", RouteKey("comfyui", "anima", "selfie", "anima.json"), timeout_seconds=2,
+            settings={"outfit_mode_parameters": {"free_outfit": {"lora_strength": 0.7, "unknown": 1}}},
+        )
+        result = await ComfyUIServiceAdapter(service, poll_interval=0.01).generate(
+            route, spec, AnimaPromptCompiler().compile(spec), ReferencePlan((), (), (), True), [],
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(0.7, service.slots["lora_strength"])
+        self.assertNotIn("unknown", service.slots)
+        self.assertEqual("outfit_mode_parameters", result.trace[1]["stage"])
+
     async def test_anima_prompt_and_reference_use_named_slots(self):
         service = _Service()
         with tempfile.TemporaryDirectory() as directory:

@@ -11,6 +11,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+try:
+    from .generation_contracts import OutfitPieceV2, OutfitSpecV2
+except ImportError:  # pragma: no cover
+    from generation_contracts import OutfitPieceV2, OutfitSpecV2
+
 
 _SELFIE_KINDS = {"selfie", "portrait", "自拍", "人像"}
 _HOME_MARKERS = (
@@ -237,11 +242,11 @@ def hot_outfit_fields(scene: str, index: int = 0) -> dict[str, str]:
         "daily": ("light cotton short-sleeve tee", "airy short-sleeve shirt"),
     }
     bottoms = {
-        "school": "lightweight straight trousers or school-appropriate knee-length bottoms",
-        "commute": "lightweight relaxed trousers",
-        "sport": "breathable athletic shorts or lightweight track pants",
-        "home": "light cotton lounge shorts or thin relaxed pants",
-        "daily": "lightweight shorts or breathable relaxed trousers",
+        "school": ("lightweight straight trousers", "school-appropriate knee-length pleated skirt"),
+        "commute": ("lightweight relaxed trousers",),
+        "sport": ("breathable athletic shorts", "lightweight track pants"),
+        "home": ("light cotton lounge shorts", "thin relaxed pants"),
+        "daily": ("lightweight shorts", "breathable relaxed trousers"),
     }
     accessories = {
         "school": "simple hair clip and lightweight school bag",
@@ -254,6 +259,155 @@ def hot_outfit_fields(scene: str, index: int = 0) -> dict[str, str]:
     return {
         "silhouette": "light breathable summer silhouette",
         "top": tops[normalized][index % len(tops[normalized])],
-        "bottom": bottoms[normalized],
+        "bottom": bottoms[normalized][index % len(bottoms[normalized])],
         "accessory": accessories[normalized],
     }
+
+
+DEFAULT_CANONICAL_OUTFIT_NEGATIVES = (
+    "official outfit", "canonical outfit", "power suit", "combat suit", "bodysuit", "leotard",
+    "armored collar", "detached collar", "chest jewel", "chest ornament", "heart-shaped gem",
+    "holographic bracelet", "waist cape", "showgirl skirt", "single thighhigh",
+    "asymmetrical sleeves", "futuristic uniform",
+)
+
+_CANONICAL_REQUEST = re.compile(
+    r"官方(?:服装|衣服|造型|作战服)|原版(?:服装|衣服|造型)|默认(?:服装|衣服|造型)|作战服|"
+    r"\b(?:official|canonical|default)\s+(?:outfit|costume|uniform)\b|\bpower\s+suit\b",
+    flags=re.I,
+)
+
+
+def infer_outfit_mode(request_text: str, *, has_outfit_reference: bool = False) -> str:
+    if _CANONICAL_REQUEST.search(str(request_text or "")):
+        return "canonical_outfit"
+    if has_outfit_reference:
+        return "reference_outfit"
+    return "free_outfit"
+
+
+def _piece(**values: str) -> OutfitPieceV2:
+    return OutfitPieceV2(**values)
+
+
+def _catalog(category: str, thermal: str) -> tuple[dict[str, Any], ...]:
+    hot = thermal in {"hot", "warm"}
+    entries: dict[str, tuple[dict[str, Any], ...]] = {
+        "homewear": (
+            {"top": _piece(kind="oversized t-shirt", color="mint green", material="soft cotton", fit="loose fit", neckline="plain crew neck", sleeves="short sleeves"), "bottom": _piece(kind="lounge shorts", color="light gray", material="lightweight cotton", fit="relaxed fit"), "legwear": "bare legs", "footwear": "white indoor slippers", "outerwear": "no jacket"},
+            {"top": _piece(kind="relaxed t-shirt", color="pale blue", material="breathable cotton", fit="loose fit", neckline="simple round neck", sleeves="short sleeves"), "bottom": _piece(kind="drawstring lounge shorts", color="cream", material="thin cotton", fit="relaxed fit"), "legwear": "bare legs", "footwear": "soft house slippers", "outerwear": "no jacket"},
+        ) if hot else (
+            {"top": _piece(kind="soft sweatshirt", color="sage green", material="cotton fleece", fit="relaxed fit", neckline="plain crew neck", sleeves="long sleeves"), "bottom": _piece(kind="straight lounge pants", color="light gray", material="soft cotton", fit="relaxed fit"), "legwear": "bare ankles", "footwear": "soft house slippers", "outerwear": "no jacket"},
+        ),
+        "sleepwear": (
+            {"top": _piece(kind="pajama shirt", color="pale blue", material="lightweight cotton", fit="loose fit", neckline="simple fold-down collar", sleeves="short sleeves"), "bottom": _piece(kind="matching pajama shorts", color="pale blue", material="lightweight cotton", fit="loose fit"), "legwear": "bare legs", "footwear": "soft house slippers", "outerwear": "no outerwear"},
+            {"top": _piece(kind="sleep t-shirt", color="soft lavender", material="breathable cotton", fit="oversized fit", neckline="plain crew neck", sleeves="short sleeves"), "bottom": _piece(kind="plain sleep shorts", color="white", material="light cotton", fit="relaxed fit"), "legwear": "bare legs", "footwear": "bare feet", "outerwear": "no outerwear"},
+        ) if hot else (
+            {"top": _piece(kind="pajama shirt", color="pale blue", material="soft brushed cotton", fit="loose fit", neckline="simple fold-down collar", sleeves="long sleeves"), "bottom": _piece(kind="matching pajama pants", color="pale blue", material="soft brushed cotton", fit="loose fit"), "legwear": "covered legs", "footwear": "soft house slippers", "outerwear": "no outerwear"},
+        ),
+        "sportswear": (
+            {"top": _piece(kind="training t-shirt", color="white", material="quick-dry fabric", fit="athletic fit", neckline="crew neck", sleeves="short sleeves"), "bottom": _piece(kind="running shorts", color="navy blue", material="breathable performance fabric", fit="athletic fit"), "legwear": "bare legs", "footwear": "white running shoes", "outerwear": "no jacket"},
+        ),
+        "school_uniform": (
+            {"top": _piece(kind="school shirt", color="white", material="light cotton", fit="neat fit", neckline="point collar", sleeves="short sleeves"), "bottom": _piece(kind="pleated skirt", color="navy blue", material="light woven fabric", fit="knee-length fit"), "legwear": "plain ankle socks", "footwear": "black loafers", "outerwear": "no blazer"},
+        ),
+        "formalwear": (
+            {"topology": "one_piece", "one_piece": _piece(kind="simple midi dress", color="deep navy", material="matte satin", fit="tailored fit", neckline="modest square neck", sleeves="short sleeves"), "legwear": "bare legs", "footwear": "low-heel pumps", "outerwear": "no jacket"},
+        ),
+        "swimwear": (
+            {"topology": "one_piece", "one_piece": _piece(kind="one-piece swimsuit", color="teal blue", material="smooth swim fabric", fit="clean athletic fit", neckline="simple scoop neck", sleeves="sleeveless"), "legwear": "bare legs", "footwear": "poolside sandals", "outerwear": "no outerwear"},
+        ),
+        "daily_outfit": (
+            {"top": _piece(kind="plain t-shirt", color="white", material="breathable cotton", fit="relaxed fit", neckline="crew neck", sleeves="short sleeves"), "bottom": _piece(kind="pleated skirt", color="sky blue", material="lightweight woven fabric", fit="above-knee fit"), "legwear": "bare legs", "footwear": "white low-top sneakers", "outerwear": "no jacket"},
+            {"topology": "one_piece", "one_piece": _piece(kind="simple summer dress", color="mint green", material="light cotton", fit="relaxed waist fit", neckline="plain round neck", sleeves="short sleeves"), "legwear": "bare legs", "footwear": "white flat shoes", "outerwear": "no jacket"},
+        ) if hot else (
+            {"top": _piece(kind="fine-gauge cardigan", color="cream", material="light knit cotton", fit="relaxed fit", neckline="v-neck", sleeves="long sleeves"), "bottom": _piece(kind="straight trousers", color="charcoal gray", material="soft twill", fit="straight fit"), "legwear": "covered legs", "footwear": "black loafers", "outerwear": "single cardigan layer"},
+        ),
+    }
+    return entries.get(category) or entries["daily_outfit"]
+
+
+def _specific_outfit_items(request_text: str) -> tuple[str, ...]:
+    text = " ".join(str(request_text or "").split())
+    garment = re.compile(
+        r"[^,，;；。]{0,60}(?:hoodie|t-?shirt|shirt|blouse|shorts|trousers|pants|skirt|dress|"
+        r"sneakers|slippers|pajama|pyjama|sweater|cardigan|jacket|coat|uniform|sportswear|bodysuit|leotard|armor|armour|"
+        r"连帽衫|卫衣|T恤|衬衫|短裤|长裤|裤子|短裙|长裙|连衣裙|运动鞋|拖鞋|睡衣|毛衣|针织衫|外套|羽绒服|制服)"
+        r"[^,，;；。]{0,40}",
+        flags=re.I,
+    )
+    abstract_sleepwear = re.compile(r"(?:sleepwear|nightwear|pajamas?|pyjamas?|睡衣)", flags=re.I)
+    concrete_detail = re.compile(
+        r"(?:black|white|blue|green|pink|purple|lavender|gray|grey|cream|cotton|silk|satin|linen|wool|"
+        r"short[- ]sleeve|long[- ]sleeve|sleeveless|oversized|loose|fitted|button|collar|shorts|pants|"
+        r"黑|白|蓝|绿|粉|紫|灰|米色|棉|真丝|丝绸|缎|亚麻|羊毛|短袖|长袖|无袖|宽松|修身|纽扣|领|短裤|长裤)",
+        flags=re.I,
+    )
+    items: list[str] = []
+    for match in garment.finditer(text):
+        item = " ".join(match.group(0).split()).strip()
+        # “看看睡衣 / sleepwear”仍是抽象类别，不能冒充已给出的具体服装结构。
+        if abstract_sleepwear.search(item) and not concrete_detail.search(item):
+            continue
+        if item and item not in items:
+            items.append(item)
+    return tuple(items[:8])
+
+
+def resolve_structured_outfit(
+    *,
+    category: str,
+    thermal_level: str,
+    context_key: str,
+    request_text: str = "",
+    has_outfit_reference: bool = False,
+    canonical_forbidden: tuple[str, ...] = DEFAULT_CANONICAL_OUTFIT_NEGATIVES,
+) -> OutfitSpecV2:
+    mode = infer_outfit_mode(request_text, has_outfit_reference=has_outfit_reference)
+    normalized_category = str(category or "daily_outfit").strip().lower()
+    explicit = _specific_outfit_items(request_text)
+    templates = _catalog(normalized_category, thermal_level)
+    digest = hashlib.sha256(str(context_key or request_text or normalized_category).encode("utf-8", "ignore")).digest()
+    selected = dict(templates[int.from_bytes(digest[:2], "big") % len(templates)])
+    if mode == "canonical_outfit":
+        selected = {
+            "explicit_items": explicit or ("official canonical outfit exactly as requested",),
+            "top": OutfitPieceV2(), "bottom": OutfitPieceV2(), "one_piece": OutfitPieceV2(),
+            "outerwear": "", "material": "", "fit": "", "layering": "one canonical outfit",
+        }
+    elif mode == "reference_outfit":
+        selected = {
+            "explicit_items": ("complete coherent outfit from the submitted outfit reference image",),
+            "top": OutfitPieceV2(), "bottom": OutfitPieceV2(), "one_piece": OutfitPieceV2(),
+            "outerwear": "", "material": "", "fit": "", "layering": "preserve referenced layering",
+        }
+    elif explicit:
+        selected = {
+            "explicit_items": explicit,
+            "top": OutfitPieceV2(), "bottom": OutfitPieceV2(), "one_piece": OutfitPieceV2(),
+            "outerwear": "no additional outerwear" if not re.search(r"jacket|coat|hoodie|外套|羽绒服|连帽衫|卫衣", request_text, re.I) else "",
+            "material": "materials exactly as requested", "fit": "fit exactly as requested",
+            "layering": "single coherent layering",
+        }
+    selected.setdefault("topology", "separates")
+    selected.setdefault("top", OutfitPieceV2())
+    selected.setdefault("bottom", OutfitPieceV2())
+    selected.setdefault("one_piece", OutfitPieceV2())
+    selected.setdefault("material", "weather-appropriate fabric")
+    selected.setdefault("fit", "coherent comfortable fit")
+    selected.setdefault("layering", "single coherent layering")
+    request_lower = str(request_text or "").lower()
+    selected["forbidden_details"] = (
+        ()
+        if mode != "free_outfit"
+        else tuple(term for term in canonical_forbidden if term.lower() not in request_lower)
+    )
+    outfit = OutfitSpecV2(
+        mode=mode,
+        category=normalized_category,
+        source="explicit_request" if explicit else "ambient_catalog",
+        fingerprint=hashlib.sha256(repr((normalized_category, thermal_level, selected)).encode("utf-8", "ignore")).hexdigest(),
+        **selected,
+    )
+    outfit.validate()
+    return outfit

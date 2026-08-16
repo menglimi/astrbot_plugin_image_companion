@@ -236,6 +236,69 @@ class ReferenceBindingV1:
 
 
 @dataclass(frozen=True, slots=True)
+class OutfitPieceV2:
+    kind: str = ""
+    color: str = ""
+    material: str = ""
+    fit: str = ""
+    neckline: str = ""
+    sleeves: str = ""
+    layer: str = ""
+
+    def tags(self) -> tuple[str, ...]:
+        garment = " ".join(value for value in (self.color, self.material, self.kind) if value)
+        ordered = (garment, self.neckline, self.sleeves, self.fit, self.layer)
+        return _tuple_text(ordered, 160)
+
+
+@dataclass(frozen=True, slots=True)
+class OutfitSpecV2:
+    schema_version: int = 2
+    mode: str = "free_outfit"
+    category: str = "daily_outfit"
+    topology: str = "separates"
+    palette: tuple[str, ...] = ()
+    top: OutfitPieceV2 = field(default_factory=OutfitPieceV2)
+    bottom: OutfitPieceV2 = field(default_factory=OutfitPieceV2)
+    one_piece: OutfitPieceV2 = field(default_factory=OutfitPieceV2)
+    legwear: str = ""
+    footwear: str = ""
+    outerwear: str = "no outerwear"
+    material: str = ""
+    fit: str = ""
+    layering: str = "single layer"
+    accessories: tuple[str, ...] = ()
+    explicit_items: tuple[str, ...] = ()
+    forbidden_details: tuple[str, ...] = ()
+    visible_focus: tuple[str, ...] = ("top", "neckline", "sleeves")
+    source: str = "policy"
+    fingerprint: str = ""
+
+    def validate(self) -> None:
+        if self.schema_version != 2:
+            raise ContractValidationError("unsupported outfit schema version")
+        if self.mode not in {"canonical_outfit", "free_outfit", "reference_outfit"}:
+            raise ContractValidationError(f"unsupported outfit mode: {self.mode}")
+        if self.topology not in {"separates", "one_piece", "layered"}:
+            raise ContractValidationError(f"unsupported outfit topology: {self.topology}")
+        if self.topology == "one_piece" and not self.one_piece.kind and not self.explicit_items:
+            raise ContractValidationError("one-piece outfit requires a garment")
+        if self.topology != "one_piece" and not self.top.kind and not self.explicit_items:
+            raise ContractValidationError("separate outfit requires a top")
+
+    def positive_tags(self) -> tuple[str, ...]:
+        values: list[str] = ["single coherent outfit", *self.explicit_items]
+        if self.topology == "one_piece":
+            values.extend(self.one_piece.tags())
+        else:
+            values.extend(self.top.tags())
+            values.extend(self.bottom.tags())
+        values.extend((self.legwear, self.footwear, self.outerwear, self.material, self.fit, self.layering))
+        values.extend(self.accessories)
+        return _tuple_text(values, 200)
+
+
+@dataclass(frozen=True, slots=True)
 class WardrobeSpecV1:
     category: str = "daily_outfit"
     required: tuple[str, ...] = ()
@@ -244,6 +307,7 @@ class WardrobeSpecV1:
     source: str = "policy"
     user_override: bool = False
     lock_outfit: bool = False
+    outfit: OutfitSpecV2 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,7 +454,7 @@ def contract_dict(value: Any) -> dict[str, Any]:
     return asdict(value)
 
 
-__all__ = [name for name in globals() if name.endswith("V1")] + [
+__all__ = [name for name in globals() if name.endswith(("V1", "V2"))] + [
     "SCHEMA_VERSION", "ContractValidationError", "contract_dict",
     "thermal_level_for_temperature", "REFERENCE_ROLES",
 ]

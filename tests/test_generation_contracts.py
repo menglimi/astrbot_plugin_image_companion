@@ -13,6 +13,8 @@ from generation_contracts import (  # noqa: E402
     BackendCapabilitiesV1,
     ContractValidationError,
     GenerationResultV1,
+    OutfitPieceV2,
+    OutfitSpecV2,
     PromptPackageV1,
     ReferenceBindingV1,
     WorkflowManifestV1,
@@ -22,6 +24,18 @@ from reference_asset_gate import ReferenceAssetGate  # noqa: E402
 
 
 class VersionedContractTests(unittest.TestCase):
+    def test_structured_outfit_validates_topology_and_serializes(self):
+        outfit = OutfitSpecV2(
+            mode="free_outfit",
+            category="homewear",
+            top=OutfitPieceV2(kind="oversized t-shirt", color="mint green"),
+            bottom=OutfitPieceV2(kind="lounge shorts", color="light gray"),
+        )
+        outfit.validate()
+        self.assertIn("oversized t-shirt", " ".join(outfit.positive_tags()))
+        with self.assertRaises(ContractValidationError):
+            OutfitSpecV2(topology="one_piece").validate()
+
     def test_prompt_capability_reference_and_result_validators_fail_closed(self):
         with self.assertRaises(ContractValidationError):
             PromptPackageV1(positive_prompt="").validate()

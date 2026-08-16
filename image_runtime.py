@@ -213,12 +213,14 @@ from .photo_wardrobe_decision import (
     resolve_photo_wardrobe_decision,
 )
 from .generation_policy import (
+    DEFAULT_CANONICAL_OUTFIT_NEGATIVES,
     apply_ambient_wardrobe_intent,
     character_identity_appearance_from_persona,
     extract_temperature_facts,
     infer_ambient_wardrobe_policy,
     outfit_context_fingerprint,
     hot_outfit_fields,
+    resolve_structured_outfit,
 )
 from .generation_adapters import (
     ComfyUIServiceAdapter,
@@ -226,7 +228,7 @@ from .generation_adapters import (
     OnlineEndpointAdapter,
     validate_output_image,
 )
-from .generation_config import build_route_registry, parse_rollout_config
+from .generation_config import build_route_registry, parse_rollout_config, resolve_wardrobe_profile
 from .generation_contracts import (
     CharacterIdentitySpecV1,
     CompositionSpecV1,
@@ -11418,13 +11420,13 @@ Output:
                 "location-appropriate background, no phone covering face, not body-only"
             ),
             "居家睡衣": (
-                "sleepwear or bedtime loungewear portrait matching the explicit clothing request and selected reference, "
+                "sleepwear or bedtime loungewear portrait matching the explicit clothing request, "
                 "exactly one coherent sleepwear outfit, preserve the character identity, natural home or bedtime context, "
                 "do not restore a daytime outfit, coat, school uniform, or commuter layers unless explicitly requested"
             ),
             "居家服": (
                 "comfortable homewear portrait, one coherent relaxed indoor outfit, natural home activity and lived-in setting, "
-                "preserve the character identity and selected homewear reference, no commuter coat or formal layers unless requested"
+                "preserve the character identity, no commuter coat or formal layers unless requested"
             ),
             "校服人像": (
                 "school-uniform portrait matching the explicit request, one coherent uniform with consistent layers and colors, "
@@ -11970,6 +11972,45 @@ Output:
             reference_candidate,
             wardrobe,
         )
+        outfit_reference_submitted = any(
+            "outfit" in tuple(getattr(binding, "roles", ()) or ())
+            for binding, _candidate, _path in submitted_reference_entries
+        )
+        structured_outfit = None
+        structured_outfit_positive = ""
+        structured_outfit_negative = ""
+        wardrobe_applicable = str(workflow_kind or "").strip().lower() in {
+            "selfie", "portrait", "自拍", "人像",
+        } or bool(wardrobe.category)
+        if wardrobe_applicable:
+            outfit_context_key = hashlib.sha256(
+                f"{scene_context_after}|{current_user_request}|{wardrobe.category}".encode("utf-8", "ignore")
+            ).hexdigest()
+            image_config = getattr(self._image_service, "config", {}) or {}
+            character_key = _single_line(getattr(self, "bot_name", ""), 120) or "bot"
+            wardrobe_profile = resolve_wardrobe_profile(
+                image_config if isinstance(image_config, dict) else {},
+                character_id=character_key,
+                model_profile="legacy",
+            )
+            configured_forbidden = wardrobe_profile.get("free_outfit_forbidden")
+            canonical_forbidden = (
+                tuple(str(item).strip() for item in configured_forbidden if str(item).strip())
+                if isinstance(configured_forbidden, (list, tuple))
+                else DEFAULT_CANONICAL_OUTFIT_NEGATIVES
+            )
+            structured_outfit = resolve_structured_outfit(
+                category=wardrobe.category or "daily_outfit",
+                thermal_level=getattr(ambient_wardrobe_policy, "thermal_level", "unknown"),
+                context_key=outfit_context_key,
+                request_text=current_user_request or original_prompt_text,
+                has_outfit_reference=outfit_reference_submitted,
+                canonical_forbidden=canonical_forbidden,
+            )
+            structured_outfit_positive = "Concrete wardrobe specification: " + ", ".join(
+                structured_outfit.positive_tags()
+            )
+            structured_outfit_negative = ", ".join(structured_outfit.forbidden_details)
         compact_scene_hint = self._photo_generation_compact_scene_hint(scene_context_after)
         scene_section = self._photo_generation_selfie_scene_constraint(
             workflow_kind,
@@ -12021,6 +12062,13 @@ Output:
             self._photo_generation_workflow_fixed_prompt_section(workflow_kind)
         )
         generated_sections = (
+            PhotoPromptSection(
+                name="structured_wardrobe",
+                source="wardrobe_structure",
+                positive=structured_outfit_positive,
+                negative=structured_outfit_negative,
+                protected=True,
+            ),
             PhotoPromptSection(
                 name="wardrobe_decision",
                 source="wardrobe_decision",
@@ -12337,6 +12385,7 @@ Output:
             session_key=session_key,
             managed_reference_gate=structured_reference_gate,
             managed_reference_plan=structured_reference_plan,
+            structured_outfit=structured_outfit,
         )
         if unified_result is not None:
             self._append_photo_generation_trace_event(
@@ -19159,6 +19208,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         session_key: str,
         managed_reference_gate: Any | None = None,
         managed_reference_plan: Any | None = None,
+        structured_outfit: Any | None = None,
     ) -> Any | None:
         config = getattr(self._image_service, "config", {}) or {}
         rollout = parse_rollout_config(config if isinstance(config, dict) else {})
@@ -19181,6 +19231,21 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         if not candidates:
             return None
         route = candidates[0]
+        if structured_outfit is not None and getattr(structured_outfit, "mode", "") == "free_outfit":
+            character_key = _single_line(getattr(self, "bot_name", ""), 120) or "bot"
+            active_wardrobe_profile = resolve_wardrobe_profile(
+                config if isinstance(config, dict) else {},
+                character_id=character_key,
+                model_profile=route.key.model_profile,
+            )
+            active_forbidden = active_wardrobe_profile.get("free_outfit_forbidden")
+            if isinstance(active_forbidden, (list, tuple)):
+                structured_outfit = replace(
+                    structured_outfit,
+                    forbidden_details=tuple(
+                        str(item).strip() for item in active_forbidden if str(item).strip()
+                    ),
+                )
         if managed_reference_plan is not None and route.key.backend != "comfyui":
             return None
 
@@ -19253,10 +19318,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         location = self._unified_scene_field(r"当前位置[：:]\s*([^；;]+)", scene_context, 160)
         activity = self._unified_scene_field(r"当前日程[：:]\s*([^；;]+)", scene_context, 240)
         sleep_phase = "preparing_for_sleep" if wardrobe.category == "sleepwear" else "awake"
-        required = tuple(dict.fromkeys((wardrobe.category, *(getattr(ambient_policy, "required", ()) or ()))))
+        outfit_required = tuple(structured_outfit.positive_tags()) if structured_outfit is not None else ()
+        required = tuple(dict.fromkeys((*outfit_required, wardrobe.category, *(getattr(ambient_policy, "required", ()) or ()))))
         forbidden_values = [
             *(getattr(ambient_policy, "forbidden", ()) or ()),
             wardrobe.negative_instruction,
+            *(tuple(structured_outfit.forbidden_details) if structured_outfit is not None else ()),
         ]
         if operation in {"selfie", "portrait"}:
             forbidden_values.extend(SELFIE_UI_NEGATIVE_TERMS)
@@ -19365,6 +19432,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 source=wardrobe.source or "policy",
                 user_override=wardrobe.source == "user_prompt",
                 lock_outfit=wardrobe.lock_outfit,
+                outfit=structured_outfit,
             ),
             references=tuple(references),
             composition=CompositionSpecV1(

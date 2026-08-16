@@ -13,10 +13,19 @@ from generation_config import (  # noqa: E402
     legacy_migration_preview,
     parse_rollout_config,
     route_diagnostics,
+    resolve_wardrobe_profile,
 )
 
 
 class GenerationConfigTests(unittest.TestCase):
+    def test_wardrobe_profile_prefers_character_and_model_match(self):
+        config = {"engine": {"wardrobe_profiles": [
+            {"character_ids": ["*"], "model_profiles": ["*"], "free_outfit_forbidden": ["generic"]},
+            {"character_ids": ["小爱"], "model_profiles": ["anima"], "free_outfit_forbidden": ["armored collar"]},
+        ]}}
+        profile = resolve_wardrobe_profile(config, character_id="小爱", model_profile="anima")
+        self.assertEqual(["armored collar"], profile["free_outfit_forbidden"])
+
     def test_instant_rollback_overrides_active_mode(self):
         rollout = parse_rollout_config({"engine": {"mode": "active", "instant_rollback": True}})
         self.assertFalse(rollout.engine_enabled)
