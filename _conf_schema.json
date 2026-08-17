@@ -1,9 +1,9 @@
 {
   "enabled": {
-    "description": "启用独立生图服务",
+    "description": "启用生图扩展服务（配置请到陪伴面板）",
     "type": "bool",
     "default": true,
-    "hint": "关闭后仅停用生图能力，主陪伴插件的普通聊天与其他陪伴功能不受影响。"
+    "hint": "生图扩展由“我会永远陪着你”统一接管；关闭后仅停用生图能力。"
   },
   "migration": {
     "description": "迁移兼容",

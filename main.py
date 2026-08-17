@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The standalone image-generation extension API for the companion series."""
+"""Image-generation extension API owned by the private companion host."""
 from __future__ import annotations
 
 import asyncio
@@ -20,8 +20,7 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.0"
-PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+PLUGIN_VERSION = "0.3.1"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
@@ -101,6 +100,9 @@ class ImageCompanionExtensionAPI:
     def status(self) -> dict[str, Any]:
         return self._plugin.status()
 
+    def _host_available(self) -> bool:
+        return self._plugin._private_companion_api() is not None
+
     def generation_route_diagnostics(self) -> dict[str, Any]:
         """Return redacted route validation and a non-mutating migration preview."""
         return route_diagnostics(self._plugin.config)
@@ -137,6 +139,16 @@ class ImageCompanionExtensionAPI:
         return self._comfyui_service(owner).validate_mapping(workflow_id, mapping, save=save)
 
     def capability_status(self, owner: Any) -> dict[str, Any]:
+        if not self._host_available():
+            return {
+                "installed": True,
+                "enabled": self._plugin.enabled,
+                "available": False,
+                "reason": "private_companion_required",
+                "selected_backend": str(self._plugin.image_setting("photo_generation_backend", "auto") or "auto"),
+                "backup_external_note": "private_companion_required",
+                "backends": {},
+            }
         if not self._plugin.enabled:
             return {
                 "installed": True,
@@ -150,29 +162,33 @@ class ImageCompanionExtensionAPI:
         return ImageGenerationRuntime(self._plugin, owner).capability_status()
 
     def local_load_state(self, owner: Any, *, force_refresh: bool = False) -> dict[str, Any]:
+        if not self._host_available():
+            return {"enabled": self._plugin.enabled, "available": False, "busy": False, "reason": "private_companion_required"}
         if not self._plugin.enabled:
-            return {"enabled": False, "available": False, "busy": False, "reason": "独立生图插件未启用"}
+            return {"enabled": False, "available": False, "busy": False, "reason": "生图扩展未启用"}
         return ImageGenerationRuntime(self._plugin, owner).local_load_state(force_refresh=force_refresh)
 
     async def maintenance(self, owner: Any) -> dict[str, Any]:
-        if not self._plugin.enabled:
+        if not self._plugin.enabled or not self._host_available():
             return {}
         runtime = ImageGenerationRuntime(self._plugin, owner)
         return await runtime._maybe_cleanup_generated_photos(force=True)
 
     async def generate_for_companion(self, owner: Any, request: dict[str, Any]) -> dict[str, Any]:
+        if not self._host_available():
+            return {"handled": False, "reason": "private_companion_required"}
         if not self._plugin.enabled:
             return {"handled": False, "reason": "disabled"}
         try:
             runtime = ImageGenerationRuntime(self._plugin, owner)
             backend, image_path, note = await runtime.generate(dict(request or {}))
         except Exception as exc:
-            logger.exception("[ImageCompanion] 独立生图执行失败: error_type=%s", type(exc).__name__)
+            logger.exception("[ImageCompanion] 生图扩展执行失败: error_type=%s", type(exc).__name__)
             return {
                 "handled": True,
-                "backend": "独立生图服务",
+                "backend": "生图扩展",
                 "image_path": "",
-                "note": "独立生图服务执行失败，请在排障页查看生图记录。",
+                "note": "生图扩展执行失败，请在排障页查看生图记录。",
             }
         self._plugin._note_generation(backend, image_path, note, request)
         metadata = runtime._photo_generation_result_metadata(
@@ -190,10 +206,12 @@ class ImageCompanionExtensionAPI:
 
     async def test_endpoint(self, owner: Any, endpoint: dict[str, Any], prompt: str) -> dict[str, Any]:
         """Run the existing endpoint diagnostic through the split runtime."""
+        if not self._host_available():
+            return {"ok": False, "message": "请先安装并启用“我会永远陪着你”"}
         runtime = ImageGenerationRuntime(self._plugin, owner)
         runner = getattr(runtime, "_run_external_photo_generation_with_endpoint", None)
         if not callable(runner):
-            return {"ok": False, "message": "独立生图运行时不支持在线 API 测试"}
+            return {"ok": False, "message": "生图扩展运行时不支持在线 API 测试"}
         outcome = await runner(
             dict(endpoint or {}),
             str(prompt or "a simple test image"),
@@ -210,7 +228,7 @@ class ImageCompanionExtensionAPI:
 @register(
     PLUGIN_NAME,
     "menglimi",
-    "我会画给你看：陪伴体系的独立生图、改图与参考图库服务。",
+    "我会画给你看：陪伴体系的生图、改图与参考图库服务。",
     PLUGIN_VERSION,
 )
 class ImageCompanionPlugin(Star):
@@ -238,16 +256,10 @@ class ImageCompanionPlugin(Star):
         _active_plugin = self
 
     async def initialize(self) -> None:
-        register_api = getattr(self.context, "register_web_api", None)
-        if not callable(register_api):
-            logger.warning("[ImageCompanion] 当前 AstrBot 不支持插件拓展页 API")
-            return
-        register_api(
-            f"{PAGE_API_PREFIX}/status",
-            self.page_status,
-            ["GET"],
-            "Image Companion status",
-        )
+        if self._private_companion_api() is None:
+            logger.warning("[ImageCompanion] 未检测到陪伴主插件，生图扩展保持不可用")
+        else:
+            logger.info("[ImageCompanion] 已接入陪伴主插件，页面与运行入口由陪伴面板统一管理")
 
     def _private_companion_api(self) -> Any | None:
         module_names = (
@@ -463,7 +475,7 @@ class ImageCompanionPlugin(Star):
         except FileNotFoundError:
             return
         except Exception as exc:
-            logger.warning("[ImageCompanion] 读取独立生图状态失败: error_type=%s", type(exc).__name__)
+            logger.warning("[ImageCompanion] 读取生图扩展状态失败: error_type=%s", type(exc).__name__)
 
     def _save_image_state_sync(self) -> None:
         self._image_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,14 +491,18 @@ class ImageCompanionPlugin(Star):
             try:
                 await asyncio.to_thread(self._save_image_state_sync)
             except Exception as exc:
-                logger.warning("[ImageCompanion] 保存独立生图状态失败: error_type=%s", type(exc).__name__)
+                logger.warning("[ImageCompanion] 保存生图扩展状态失败: error_type=%s", type(exc).__name__)
 
     def status(self) -> dict[str, Any]:
         metrics = getattr(self, "generation_metrics", None)
+        managed = self._private_companion_api() is not None
         return {
+            "installed": True,
             "enabled": self.enabled,
-            "managed_by_private_companion": self._private_companion_api() is not None,
-            "state": "compatibility_migration" if self.reuse_private_companion_settings else "independent",
+            "available": bool(self.enabled and managed),
+            "managed_by_private_companion": managed,
+            "state": "managed" if managed else "unavailable",
+            "reason": "" if managed else "private_companion_required",
             "reuse_private_companion_settings": self.reuse_private_companion_settings,
             "reuse_private_companion_assets": self.reuse_private_companion_assets,
             "generation_count": self.generation_count,
@@ -494,9 +510,6 @@ class ImageCompanionPlugin(Star):
             "unified_engine": route_diagnostics(getattr(self, "config", {}) or {}),
             "metrics": metrics.snapshot() if callable(getattr(metrics, "snapshot", None)) else {},
         }
-
-    async def page_status(self) -> dict[str, Any]:
-        return {"ok": True, "data": self.status()}
 
     async def terminate(self) -> None:
         global _active_plugin
