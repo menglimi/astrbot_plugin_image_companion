@@ -8500,19 +8500,44 @@ Output:
 
         scene = await self._build_photo_scene_prompt(user, name, reason)
         workflow_kind = scene.get("kind", "text2img")
-        subject_owner = _normalize_photo_subject_owner(scene.get("subject_owner"))
+        normalized_workflow_kind = _single_line(workflow_kind, 40).strip().lower()
+        raw_subject_owner = _normalize_photo_subject_owner(scene.get("subject_owner"))
+        subject_owner = raw_subject_owner
         if not subject_owner:
-            subject_owner = "bot" if bool(scene.get("use_persona_reference")) or workflow_kind == "selfie" else "scene"
+            subject_owner = (
+                "bot"
+                if bool(scene.get("use_persona_reference"))
+                or normalized_workflow_kind in {"selfie", "portrait", "自拍", "人像"}
+                else "scene"
+            )
+        if normalized_workflow_kind in {"selfie", "portrait", "自拍", "人像"} and subject_owner == "scene":
+            subject_owner = "bot"
+        identity_reference_required = raw_subject_owner not in {"third_party", "unknown"} and (
+            bool(scene.get("use_persona_reference"))
+            or normalized_workflow_kind in {"selfie", "portrait", "自拍", "人像"}
+            or subject_owner == "bot"
+        )
         session_key = str(user.get("umo") or user.get("user_id") or name)
         continuity_key = self._compose_photo_continuity_key(session_key, user.get("user_id"))
         reference_image_path = ""
-        if bool(scene.get("use_persona_reference")):
+        if identity_reference_required:
             # Character-bearing photo_text scenes need identity continuity even when
             # their rendering workflow is text2img rather than selfie.
             reference_image_path = await self._photo_persona_reference_image_for_kind_async(
                 "selfie",
                 allow_daily_outfit=True,
                 request_text=scene["prompt"],
+            )
+            if not reference_image_path:
+                return (
+                    "photo_text：本次画面需要 Bot 身份参考图，但当前没有可用参考图，已停止生图"
+                    "，避免生成无身份来源的人物。"
+                )
+        elif subject_owner == "scene":
+            scene["prompt"] = self._append_photo_negative_terms(
+                scene.get("prompt", ""),
+                ["people", "human figures", "faces", "silhouettes"],
+                limit=900,
             )
         backend_name, image_path, workflow_note = await self._generate_photo_image(
             workflow_kind=workflow_kind,
@@ -12372,21 +12397,37 @@ Output:
                 _single_line(scene_context_after, 180),
                 bool(reference_image_path),
             )
-        preferred = self.photo_generation_backend
-        unified_result = await self._run_unified_generation_engine(
-            workflow_kind=workflow_kind,
-            request_id=trace_id,
-            request_text=current_user_request or original_prompt_text,
-            legacy_prompt=local_backend_prompt_text,
-            scene_context=scene_context_after or scene_context_before,
-            wardrobe=wardrobe,
-            ambient_policy=ambient_wardrobe_policy,
-            reference_entries=submitted_reference_entries,
-            session_key=session_key,
-            managed_reference_gate=structured_reference_gate,
-            managed_reference_plan=structured_reference_plan,
-            structured_outfit=structured_outfit,
+        identity_reference_required = (
+            normalized_kind in {"selfie", "portrait", "自拍", "人像"}
+            and "identity" in set(reference_intent.requested_roles or ())
+            and "identity" not in set(reference_intent.excluded_roles or ())
         )
+        identity_reference_submitted = any(
+            "identity" in tuple(getattr(binding, "roles", ()) or ())
+            for binding in submitted_bindings
+        )
+        missing_identity_reference = (
+            identity_reference_required
+            and not identity_reference_submitted
+            and not structured_reference_plan
+        )
+        preferred = self.photo_generation_backend
+        unified_result = None
+        if not missing_identity_reference:
+            unified_result = await self._run_unified_generation_engine(
+                workflow_kind=workflow_kind,
+                request_id=trace_id,
+                request_text=current_user_request or original_prompt_text,
+                legacy_prompt=local_backend_prompt_text,
+                scene_context=scene_context_after or scene_context_before,
+                wardrobe=wardrobe,
+                ambient_policy=ambient_wardrobe_policy,
+                reference_entries=submitted_reference_entries,
+                session_key=session_key,
+                managed_reference_gate=structured_reference_gate,
+                managed_reference_plan=structured_reference_plan,
+                structured_outfit=structured_outfit,
+            )
         if unified_result is not None:
             self._append_photo_generation_trace_event(
                 trace_id,
@@ -12642,6 +12683,13 @@ Output:
                 "上下文清理",
                 "",
                 "生图上下文仍存在未能安全清理的服装冲突，已停止调用后端",
+            )
+
+        if missing_identity_reference:
+            return finish(
+                "参考图",
+                "",
+                "本次人物画面需要可用的身份参考图，当前未找到，已停止无参考图生成人物。",
             )
 
         if unified_result is not None:
@@ -13171,6 +13219,12 @@ Output:
                 if re.search(r"\b(?:person|people|man|woman|boy|girl|character|human)\b", character_text, flags=re.I)
                 or any(token in character_text for token in ("人物", "男人", "女人", "男生", "女生", "男孩", "女孩", "路人"))
                 else "scene"
+            )
+        if not use_persona_reference and subject_owner == "scene":
+            image_prompt = self._append_photo_negative_terms(
+                image_prompt,
+                ["people", "human figures", "faces", "silhouettes"],
+                limit=900,
             )
         return {
             "kind": kind,
@@ -14200,7 +14254,9 @@ Output:
                     allow_daily_outfit=allow_daily_outfit,
                 )
         if not candidates:
-            return empty_selection("no_candidates")
+            return empty_selection(
+                "identity_reference_unavailable" if portrait_workflow else "no_candidates"
+            )
         legacy_context = str(selection_context or "").strip()
         if legacy_context:
             looks_like_ambient_context = bool(
@@ -14328,6 +14384,27 @@ Output:
             )
         ]
         fallback = max(normal_scored, key=lambda pair: pair[1])[0] if normal_scored else None
+        identity_fallback = next(
+            (
+                item
+                for item in eligible_candidates
+                if item.get("kind") == "persona"
+                and "identity" in set(item.get("reference_roles") or ())
+            ),
+            None,
+        )
+        if identity_fallback is None:
+            identity_fallback = next(
+                (
+                    item
+                    for item, _score in sorted(
+                        normal_scored,
+                        key=lambda pair: (-pair[1], str(pair[0].get("id") or "")),
+                    )
+                    if "identity" in set(item.get("reference_roles") or ())
+                ),
+                None,
+            )
         selected = fallback
         selection_source = "rule_fallback"
         selection_reason = "model_not_attempted" if eligible_candidates else "no_eligible_reference"
@@ -14407,9 +14484,14 @@ Output:
                 match = re.search(r"(?<!\d)(\d{1,2})(?!\d)", model_reply)
                 choice = int(match.group(1)) if match else -1
                 if match and choice == 0:
-                    selected = None
-                    selection_source = "model"
-                    selection_reason = "fresh_image_requested"
+                    if portrait_workflow and identity_fallback:
+                        selected = identity_fallback
+                        selection_source = "identity_fallback"
+                        selection_reason = "model_requested_no_reference_but_identity_required"
+                    else:
+                        selected = None
+                        selection_source = "model"
+                        selection_reason = "fresh_image_requested"
                 elif match and 1 <= choice <= len(eligible_candidates):
                     proposed = eligible_candidates[choice - 1]
                     model_selected_id = str(proposed.get("id") or "")
@@ -14443,9 +14525,19 @@ Output:
                         selection_source = "model"
                         selection_reason = "valid_candidate_number"
                 elif not model_reply:
-                    selection_reason = "model_empty_response"
+                    if portrait_workflow and identity_fallback:
+                        selected = identity_fallback
+                        selection_source = "identity_fallback"
+                        selection_reason = "model_empty_response_identity_fallback"
+                    else:
+                        selection_reason = "model_empty_response"
                 elif match:
-                    selection_reason = "model_candidate_out_of_range"
+                    if portrait_workflow and identity_fallback:
+                        selected = identity_fallback
+                        selection_source = "identity_fallback"
+                        selection_reason = "model_candidate_out_of_range_identity_fallback"
+                    else:
+                        selection_reason = "model_candidate_out_of_range"
             except Exception as exc:
                 selection_reason = f"model_error:{type(exc).__name__}"
                 logger.info(
@@ -14459,6 +14551,19 @@ Output:
             selection_reason = "empty_selection_context"
         elif not callable(llm_call):
             selection_reason = "model_unavailable"
+
+        if portrait_workflow and (
+            not isinstance(selected, dict)
+            or "identity" not in set(selected.get("reference_roles") or ())
+        ):
+            if identity_fallback:
+                selected = identity_fallback
+                selection_source = "identity_fallback"
+                selection_reason = "identity_required_candidate_fallback"
+            else:
+                selected = None
+                selection_source = "none"
+                selection_reason = "identity_reference_unavailable"
 
         score_summary = ",".join(
             f"{_single_line(item.get('id'), 40)}={score:g}"
