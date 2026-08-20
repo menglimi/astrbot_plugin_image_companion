@@ -306,6 +306,68 @@
         "description": "本地生图内存延后阈值",
         "type": "int",
         "default": 88
+      },
+      "debug": {
+        "description": "生图 debug 日志",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用统一 debug 日志",
+            "type": "bool",
+            "default": false
+          },
+          "capture_mode": {
+            "description": "debug 捕获模式",
+            "type": "string",
+            "default": "redacted",
+            "options": ["off", "redacted", "full", "full_with_secrets"]
+          },
+          "include_secrets": {
+            "description": "允许 debug 捕获凭据原文（高风险）",
+            "type": "bool",
+            "default": false
+          },
+          "max_file_size_kb": {
+            "description": "debug 日志单文件大小（KB）",
+            "type": "int",
+            "default": 10240
+          },
+          "backup_count": {
+            "description": "debug 日志轮转备份数",
+            "type": "int",
+            "default": 5
+          },
+          "capture_payloads": {
+            "description": "捕获大请求/响应体侧车文件",
+            "type": "bool",
+            "default": false
+          },
+          "retention_days": {
+            "description": "debug trace 保留天数",
+            "type": "int",
+            "default": 14
+          },
+          "max_body_kb": {
+            "description": "debug 单个请求或响应体上限（KB）",
+            "type": "int",
+            "default": 256
+          },
+          "max_depth": {
+            "description": "debug 结构化数据最大深度",
+            "type": "int",
+            "default": 10
+          },
+          "max_items": {
+            "description": "debug 单层最大字段数",
+            "type": "int",
+            "default": 200
+          },
+          "max_string_chars": {
+            "description": "debug 单个文本最大字符数",
+            "type": "int",
+            "default": 12000
+          }
+        }
       }
     }
   }

@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import json
 import time
+import traceback
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Awaitable, Callable, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 try:
     from .generation_contracts import (
@@ -35,6 +37,11 @@ ERROR_CODES = frozenset(
         "mapping_invalid", "capability_missing", "submission_failed", "backend_timeout",
         "result_materialization_failed", "output_validation_failed", "fallback_not_allowed",
     }
+)
+
+_DEBUG_TRACE_OWNERSHIP: ContextVar[tuple[str, bool] | None] = ContextVar(
+    "generation_engine_debug_trace_ownership",
+    default=None,
 )
 
 
@@ -206,6 +213,7 @@ class GenerationEngine:
         prompt_cache: dict[str, PromptPackageV1] | None = None,
         prompt_cache_limit: int = 256,
         route_semaphores: dict[str, asyncio.Semaphore] | None = None,
+        debug_recorder: Any = None,
     ) -> None:
         self.profiles = profiles
         self.routes = routes
@@ -219,14 +227,186 @@ class GenerationEngine:
         self._prompt_cache = prompt_cache if prompt_cache is not None else {}
         self._prompt_cache_limit = max(1, int(prompt_cache_limit))
         self._route_semaphores = route_semaphores if route_semaphores is not None else {}
+        # Optional dependency keeps legacy callers and tests unchanged.  The
+        # recorder itself is deliberately duck-typed so the engine can be used
+        # with a host application's existing diagnostics adapter.
+        self.debug_recorder = debug_recorder
 
     @staticmethod
     def _event(stage: str, **data: Any) -> dict[str, Any]:
         return {"stage": stage, "at": time.time(), "data": data}
 
+    def _debug_start(self, spec: GenerationSpecV1, route_name: str) -> str:
+        recorder = self.debug_recorder
+        starter = getattr(recorder, "start_trace", None)
+        if not callable(starter):
+            _DEBUG_TRACE_OWNERSHIP.set(None)
+            return ""
+        # The legacy runtime uses the generation request id as its trace id.
+        # Reuse that state when present so engine events stay in the same
+        # end-to-end trace instead of creating a second, unrelated UUID.
+        requested_trace = str(spec.request_id or "").strip()
+        state_getter = getattr(recorder, "get_trace_state", None)
+        if requested_trace and callable(state_getter):
+            try:
+                if state_getter(requested_trace) is not None:
+                    _DEBUG_TRACE_OWNERSHIP.set((requested_trace, False))
+                    return requested_trace
+            except Exception:
+                pass
+        try:
+            trace_id = starter(
+                requested_trace or None,
+                request_id=spec.request_id,
+                context={
+                    "request_id": spec.request_id,
+                    "route_requested": route_name,
+                    "operation": spec.operation,
+                },
+            )
+            normalized = str(trace_id or "")
+            _DEBUG_TRACE_OWNERSHIP.set((normalized, True) if normalized else None)
+            return normalized
+        except Exception:
+            _DEBUG_TRACE_OWNERSHIP.set(None)
+            return ""
+
+    def _debug_emit(
+        self,
+        trace_id: str,
+        stage: str,
+        *,
+        status: str = "ok",
+        data: Mapping[str, Any] | None = None,
+        payloads: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        if not trace_id:
+            return
+        emitter = getattr(self.debug_recorder, "emit", None)
+        if not callable(emitter):
+            return
+        try:
+            emitter(trace_id, stage, status=status, data=data, payloads=payloads, **fields)
+        except TypeError:
+            # Keep compatibility with older host recorders that predate
+            # sidecar payload support; the event itself remains useful.
+            try:
+                emitter(trace_id, stage, status=status, data=data, **fields)
+            except Exception:
+                return
+        except Exception:
+            # Diagnostics must never change generation behavior.
+            return
+
+    def _debug_finish(self, trace_id: str, result: GenerationResultV1, trace: Sequence[Mapping[str, Any]]) -> None:
+        if not trace_id:
+            return
+        ownership = _DEBUG_TRACE_OWNERSHIP.get()
+        borrowed = bool(ownership and ownership[0] == trace_id and not ownership[1])
+        if borrowed:
+            # The outer legacy runtime owns the request trace and writes the
+            # single terminal completed/failed event. Keep engine diagnostics
+            # visible without closing that shared trace prematurely.
+            self._debug_emit(
+                trace_id,
+                "engine_completed" if result.ok else "engine_failed",
+                status="ok",
+                data={
+                    "result": asdict(result),
+                    "engine_trace": list(trace),
+                },
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+                backend=result.backend,
+                workflow=result.workflow,
+                payloads={
+                    "result": asdict(result),
+                    "engine_trace": list(trace),
+                },
+            )
+            _DEBUG_TRACE_OWNERSHIP.set(None)
+            return
+        finisher = getattr(self.debug_recorder, "finish_trace", None)
+        if callable(finisher):
+            try:
+                finisher(
+                    trace_id,
+                    status="completed" if result.ok else "failed",
+                    stage="completed" if result.ok else "failed",
+                    data={
+                        "result": asdict(result),
+                        "engine_trace": list(trace),
+                    },
+                    error_code=result.error_code,
+                    failure_stage=result.failure_stage,
+                    backend=result.backend,
+                    workflow=result.workflow,
+                    payloads={
+                        "result": asdict(result),
+                        "engine_trace": list(trace),
+                    },
+                )
+                _DEBUG_TRACE_OWNERSHIP.set(None)
+                return
+            except Exception:
+                pass
+        self._debug_emit(
+            trace_id,
+            "completed" if result.ok else "failed",
+            status="completed" if result.ok else "failed",
+            data={"result": asdict(result), "engine_trace": list(trace)},
+            error_code=result.error_code,
+            failure_stage=result.failure_stage,
+            backend=result.backend,
+            workflow=result.workflow,
+            payloads={
+                "result": asdict(result),
+                "engine_trace": list(trace),
+            },
+        )
+        _DEBUG_TRACE_OWNERSHIP.set(None)
+
+    @staticmethod
+    def _debug_exception_payload(error: BaseException) -> dict[str, Any]:
+        return {
+            "type": type(error).__name__,
+            "message": str(error),
+            "args": list(getattr(error, "args", ()) or ()),
+            "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        }
+
+    @staticmethod
+    def _debug_bind_adapter(adapter: Any, recorder: Any, trace_id: str) -> None:
+        binder = getattr(adapter, "bind_debug", None)
+        if callable(binder):
+            try:
+                binder(recorder, trace_id)
+            except Exception:
+                return
+
+    def _debug_clear_adapters(self) -> None:
+        for adapter in self.adapters.values():
+            clearer = getattr(adapter, "clear_debug", None)
+            if callable(clearer):
+                try:
+                    clearer()
+                except Exception:
+                    continue
+
     async def generate(self, spec: GenerationSpecV1, route_name: str) -> GenerationResultV1:
         started = time.monotonic()
         trace: list[dict[str, Any]] = [self._event("context", request_id=spec.request_id)]
+        debug_trace_id = self._debug_start(spec, route_name)
+        self._debug_emit(
+            debug_trace_id,
+            "request_received",
+            request_id=spec.request_id,
+            operation=spec.operation,
+            route=route_name,
+            data={"spec": asdict(spec)},
+            payloads={"request": asdict(spec)},
+        )
         try:
             spec.validate()
         except Exception as exc:
@@ -237,6 +417,18 @@ class GenerationEngine:
                 note=f"{type(exc).__name__}: {exc}",
                 trace=tuple(trace),
             )
+            self._debug_emit(
+                debug_trace_id,
+                "context_validation",
+                status="failed",
+                request_id=spec.request_id,
+                route=route_name,
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+                error=exc,
+                payloads={"exception": self._debug_exception_payload(exc)},
+            )
+            self._debug_finish(debug_trace_id, result, trace)
             self._record_metrics(route_name, result, started)
             return result
         if not self.enabled:
@@ -247,9 +439,45 @@ class GenerationEngine:
                 note="generation engine disabled",
                 trace=tuple(trace),
             )
+            self._debug_emit(
+                debug_trace_id,
+                "route_unavailable",
+                status="failed",
+                request_id=spec.request_id,
+                route=route_name,
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+                data={"note": result.note},
+            )
+            self._debug_finish(debug_trace_id, result, trace)
             self._record_metrics(route_name, result, started)
             return result
-        result = await self._attempt(spec, route_name, trace, visited=())
+        try:
+            result = await self._attempt(spec, route_name, trace, visited=(), debug_trace_id=debug_trace_id)
+        except BaseException as exc:
+            exception_result = GenerationResultV1(
+                request_id=spec.request_id,
+                error_code="engine_exception",
+                failure_stage="engine",
+                note=f"{type(exc).__name__}: {exc}",
+                trace=tuple(trace),
+            )
+            self._debug_emit(
+                debug_trace_id,
+                "engine_exception",
+                status="failed",
+                request_id=spec.request_id,
+                route=route_name,
+                error_code=exception_result.error_code,
+                failure_stage=exception_result.failure_stage,
+                error=exc,
+                payloads={"exception": self._debug_exception_payload(exc)},
+            )
+            self._debug_finish(debug_trace_id, exception_result, trace)
+            raise
+        finally:
+            self._debug_clear_adapters()
+        self._debug_finish(debug_trace_id, result, trace)
         self._record_metrics(route_name, result, started)
         return result
 
@@ -287,26 +515,41 @@ class GenerationEngine:
         trace: list[dict[str, Any]],
         *,
         visited: tuple[str, ...],
+        debug_trace_id: str = "",
     ) -> GenerationResultV1:
         if route_name in visited:
-            return GenerationResultV1(
+            result = GenerationResultV1(
                 request_id=spec.request_id,
                 error_code="route_unavailable",
                 failure_stage="route",
                 note="fallback cycle detected",
                 trace=tuple(trace),
             )
+            self._debug_emit(debug_trace_id, "fallback_cycle", status="failed", route=route_name, error_code=result.error_code, failure_stage=result.failure_stage)
+            return result
         try:
             route = self.routes.get(route_name)
         except KeyError as exc:
-            return GenerationResultV1(
+            result = GenerationResultV1(
                 request_id=spec.request_id,
                 error_code="route_unavailable",
                 failure_stage="route",
                 note=str(exc),
                 trace=tuple(trace),
             )
+            self._debug_emit(debug_trace_id, "route_lookup", status="failed", route=route_name, error_code=result.error_code, failure_stage=result.failure_stage, error=exc)
+            return result
         trace.append(self._event("route", route=route.name, key=route.key.value()))
+        self._debug_emit(
+            debug_trace_id,
+            "route_attempt_started",
+            request_id=spec.request_id,
+            operation=spec.operation,
+            backend=route.key.backend,
+            workflow=route.key.workflow,
+            route=route.name,
+            data={"route_key": route.key.value(), "visited": list(visited)},
+        )
         adapter = self.adapters.get(route.key.backend)
         if not route.enabled or adapter is None or not self.circuit_breaker.available(route.name):
             result = GenerationResultV1(
@@ -319,7 +562,8 @@ class GenerationEngine:
                 note="route disabled, adapter missing, or circuit open",
                 trace=tuple(trace),
             )
-            return await self._fallback(spec, route, result, trace, (*visited, route_name))
+            self._debug_emit(debug_trace_id, "route_unavailable", status="failed", backend=route.key.backend, workflow=route.key.workflow, route=route.name, error_code=result.error_code, failure_stage=result.failure_stage, data={"note": result.note})
+            return await self._fallback(spec, route, result, trace, (*visited, route_name), debug_trace_id=debug_trace_id)
         try:
             cache_key = route_cache_key(
                 spec,
@@ -344,7 +588,8 @@ class GenerationEngine:
                 note=f"{type(exc).__name__}: {exc}",
                 trace=tuple(trace),
             )
-            return await self._fallback(spec, route, result, trace, (*visited, route_name))
+            self._debug_emit(debug_trace_id, "prompt_compiled", status="failed", backend=route.key.backend, workflow=route.key.workflow, route=route.name, error_code=result.error_code, failure_stage=result.failure_stage, error=exc)
+            return await self._fallback(spec, route, result, trace, (*visited, route_name), debug_trace_id=debug_trace_id)
         trace.append(
             self._event(
                 "compiler",
@@ -352,6 +597,22 @@ class GenerationEngine:
                 positive_hash=hashlib.sha256(prompt.positive_prompt.encode()).hexdigest(),
                 negative_hash=hashlib.sha256(prompt.negative_prompt.encode()).hexdigest(),
             )
+        )
+        self._debug_emit(
+            debug_trace_id,
+            "prompt_compiled",
+            request_id=spec.request_id,
+            operation=spec.operation,
+            backend=route.key.backend,
+            workflow=route.key.workflow,
+            route=route.name,
+            data={
+                "model_profile": prompt.model_profile,
+                "positive_prompt": prompt.positive_prompt,
+                "negative_prompt": prompt.negative_prompt,
+                "auxiliary_prompts": dict(prompt.auxiliary_prompts),
+                "warnings": list(prompt.warnings),
+            },
         )
         try:
             capabilities = route.capabilities_override or await adapter.capabilities(route)
@@ -373,7 +634,8 @@ class GenerationEngine:
                 note=f"{type(exc).__name__}: {exc}",
                 trace=tuple(trace),
             )
-            return await self._fallback(spec, route, result, trace, (*visited, route_name))
+            self._debug_emit(debug_trace_id, "capability_probe", status="failed", backend=route.key.backend, workflow=route.key.workflow, route=route.name, error_code=result.error_code, failure_stage=result.failure_stage, error=exc)
+            return await self._fallback(spec, route, result, trace, (*visited, route_name), debug_trace_id=debug_trace_id)
         trace.append(
             self._event(
                 "reference_plan",
@@ -381,6 +643,19 @@ class GenerationEngine:
                 omitted=[item.reference_id for item in reference_plan.omitted],
                 degraded=list(reference_plan.degraded_capabilities),
             )
+        )
+        self._debug_emit(
+            debug_trace_id,
+            "reference_plan",
+            request_id=spec.request_id,
+            backend=route.key.backend,
+            workflow=route.key.workflow,
+            route=route.name,
+            data={
+                "submitted": [item.reference_id for item in reference_plan.submitted],
+                "omitted": [item.reference_id for item in reference_plan.omitted],
+                "degraded": list(reference_plan.degraded_capabilities),
+            },
         )
         if not reference_plan.allowed:
             result = GenerationResultV1(
@@ -394,8 +669,18 @@ class GenerationEngine:
                 note=reference_plan.reason,
                 trace=tuple(trace),
             )
-            return await self._fallback(spec, route, result, trace, (*visited, route_name))
+            self._debug_emit(debug_trace_id, "reference_plan", status="failed", backend=route.key.backend, workflow=route.key.workflow, route=route.name, error_code=result.error_code, failure_stage=result.failure_stage, data={"reason": reference_plan.reason})
+            return await self._fallback(spec, route, result, trace, (*visited, route_name), debug_trace_id=debug_trace_id)
         if self.shadow_mode:
+            self._debug_emit(
+                debug_trace_id,
+                "shadow_mode",
+                status="warning",
+                backend=route.key.backend,
+                workflow=route.key.workflow,
+                route=route.name,
+                data={"submission_skipped": True},
+            )
             return GenerationResultV1(
                 request_id=spec.request_id,
                 backend=route.key.backend,
@@ -406,6 +691,8 @@ class GenerationEngine:
                 note="shadow_mode: submission skipped",
                 trace=tuple((*trace, self._event("shadow", route=route.name))),
             )
+        self._debug_emit(debug_trace_id, "backend_submit_started", backend=route.key.backend, workflow=route.key.workflow, route=route.name, data={"submitted_reference_ids": [item.reference_id for item in reference_plan.submitted]})
+        self._debug_bind_adapter(adapter, self.debug_recorder, debug_trace_id)
         try:
             async with self._route_semaphore(route):
                 result = await adapter.generate(route, spec, prompt, reference_plan, trace)
@@ -420,6 +707,18 @@ class GenerationEngine:
                 note=str(exc) or "backend timeout",
                 trace=tuple(trace),
             )
+            self._debug_emit(
+                debug_trace_id,
+                "backend_response",
+                status="failed",
+                backend=route.key.backend,
+                workflow=route.key.workflow,
+                route=route.name,
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+                error=exc,
+                payloads={"exception": self._debug_exception_payload(exc), "result": asdict(result)},
+            )
         except Exception as exc:
             result = GenerationResultV1(
                 request_id=spec.request_id,
@@ -431,6 +730,32 @@ class GenerationEngine:
                 note=f"{type(exc).__name__}: {exc}",
                 trace=tuple(trace),
             )
+            self._debug_emit(
+                debug_trace_id,
+                "backend_response",
+                status="failed",
+                backend=route.key.backend,
+                workflow=route.key.workflow,
+                route=route.name,
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+                error=exc,
+                payloads={"exception": self._debug_exception_payload(exc), "result": asdict(result)},
+            )
+        else:
+            self._debug_emit(
+                debug_trace_id,
+                "backend_response",
+                status="ok" if result.ok else "failed",
+                request_id=spec.request_id,
+                backend=route.key.backend,
+                workflow=route.key.workflow,
+                route=route.name,
+                data={"result": asdict(result)},
+                payloads={"response": asdict(result)},
+                error_code=result.error_code,
+                failure_stage=result.failure_stage,
+            )
         if result.ok and self.output_validator is not None:
             valid, note = self.output_validator(result.image_path)
             if not valid:
@@ -441,11 +766,23 @@ class GenerationEngine:
                     failure_stage="output_validation",
                     note=note,
                 )
+                self._debug_emit(
+                    debug_trace_id,
+                    "output_validated",
+                    status="failed",
+                    backend=route.key.backend,
+                    workflow=route.key.workflow,
+                    route=route.name,
+                    error_code=result.error_code,
+                    failure_stage=result.failure_stage,
+                    data={"note": note},
+                    payloads={"response": asdict(result)},
+                )
         if result.ok:
             self.circuit_breaker.success(route.name)
             return result
         self.circuit_breaker.failure(route.name)
-        return await self._fallback(spec, route, result, trace, (*visited, route_name))
+        return await self._fallback(spec, route, result, trace, (*visited, route_name), debug_trace_id=debug_trace_id)
 
     async def _fallback(
         self,
@@ -454,6 +791,8 @@ class GenerationEngine:
         result: GenerationResultV1,
         trace: list[dict[str, Any]],
         visited: tuple[str, ...],
+        *,
+        debug_trace_id: str = "",
     ) -> GenerationResultV1:
         for fallback_name in route.fallback_routes:
             try:
@@ -462,9 +801,11 @@ class GenerationEngine:
                 continue
             if fallback.paid and not route.allow_paid_fallback:
                 trace.append(self._event("fallback_skipped", route=fallback_name, reason="paid"))
+                self._debug_emit(debug_trace_id, "fallback_skipped", status="warning", route=route.name, data={"target": fallback_name, "reason": "paid"})
                 continue
             trace.append(self._event("fallback", source=route.name, target=fallback_name))
-            candidate = await self._attempt(spec, fallback_name, trace, visited=visited)
+            self._debug_emit(debug_trace_id, "fallback_decision", status="warning", route=route.name, data={"target": fallback_name, "source_result": asdict(result)})
+            candidate = await self._attempt(spec, fallback_name, trace, visited=visited, debug_trace_id=debug_trace_id)
             if candidate.ok:
                 return candidate
             result = candidate
