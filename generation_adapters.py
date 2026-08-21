@@ -8,10 +8,17 @@ import hashlib
 import os
 import re
 import time
+from contextvars import ContextVar
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
+
+
+_DEBUG_BINDING: ContextVar[tuple[Any, str] | None] = ContextVar(
+    "generation_adapter_debug_binding",
+    default=None,
+)
 
 try:
     from .generation_contracts import BackendCapabilitiesV1, GenerationResultV1
@@ -116,6 +123,51 @@ class ComfyUIServiceAdapter:
         self.allowed_reference_roots = allowed_reference_roots
         self.materialize = materialize
         self.poll_interval = max(0.01, poll_interval)
+        self._debug_recorder: Any = None
+        self._debug_trace_id = ""
+
+    def bind_debug(self, recorder: Any, trace_id: str) -> None:
+        """Bind the engine trace without making diagnostics a hard dependency."""
+        binding = (recorder, str(trace_id or ""))
+        _DEBUG_BINDING.set(binding)
+        # Keep these fields for compatibility with integrations that inspect
+        # adapter state, while event emission itself uses task-local context.
+        self._debug_recorder, self._debug_trace_id = binding
+
+    def clear_debug(self) -> None:
+        _DEBUG_BINDING.set(None)
+
+    def _debug_emit(
+        self,
+        stage: str,
+        *,
+        status: str = "ok",
+        data: Mapping[str, Any] | None = None,
+        payloads: Mapping[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        binding = _DEBUG_BINDING.get()
+        if binding is None:
+            return
+        recorder, trace_id = binding
+        if not trace_id or not callable(getattr(recorder, "emit", None)):
+            return
+        try:
+            recorder.emit(
+                trace_id,
+                stage,
+                status=status,
+                data=data,
+                payloads=payloads,
+                error=error,
+            )
+        except TypeError:
+            try:
+                recorder.emit(trace_id, stage, status=status, data=data, error=error)
+            except Exception:
+                return
+        except Exception:
+            return
 
     async def capabilities(self, route: RouteDefinition) -> BackendCapabilitiesV1:
         inspection = self.service.inspect_workflow(route.key.workflow)
@@ -222,13 +274,43 @@ class ComfyUIServiceAdapter:
                 name = f"reference_image_{generic_index}"
             slots[name] = self._reference_value(reference.path)
         route_mapping = route.settings.get("mapping")
-        submitted = await self.service.submit_generation(
-            route.key.workflow,
-            slots,
-            mapping=route_mapping if isinstance(route_mapping, Mapping) and route_mapping else None,
+        request_payload = {
+            "backend": self.backend,
+            "operation": spec.operation,
+            "workflow": route.key.workflow,
+            "slots": slots,
+            "mapping": route_mapping if isinstance(route_mapping, Mapping) and route_mapping else None,
+        }
+        self._debug_emit("backend_request", data={"kind": "submit", "workflow": route.key.workflow}, payloads={"request": request_payload})
+        try:
+            submitted = await self.service.submit_generation(
+                route.key.workflow,
+                slots,
+                mapping=route_mapping if isinstance(route_mapping, Mapping) and route_mapping else None,
+            )
+        except Exception as exc:
+            self._debug_emit(
+                "backend_response",
+                status="failed",
+                data={"kind": "submit", "workflow": route.key.workflow},
+                payloads={"request": request_payload, "exception": {"type": type(exc).__name__, "message": str(exc)}},
+                error=exc,
+            )
+            raise
+        self._debug_emit(
+            "backend_response",
+            status="ok",
+            data={"kind": "submit", "workflow": route.key.workflow},
+            payloads={"request": request_payload, "response": submitted},
         )
         task_id = str(submitted.get("task_id") or "")
         if not task_id:
+            self._debug_emit(
+                "backend_response",
+                status="failed",
+                data={"kind": "submit", "reason": "missing_task_id"},
+                payloads={"response": submitted},
+            )
             return GenerationResultV1(request_id=spec.request_id, backend=self.backend, error_code="submission_failed", failure_stage="submission")
         trace.append({
             "stage": "submission",
@@ -238,17 +320,39 @@ class ComfyUIServiceAdapter:
         deadline = time.monotonic() + max(1, route.timeout_seconds)
         while time.monotonic() < deadline:
             result = await self.service.get_result(task_id)
+            self._debug_emit(
+                "backend_poll_response",
+                status="ok",
+                data={"task_id": task_id, "status": result.get("status") if isinstance(result, Mapping) else ""},
+                payloads={"response": result},
+            )
             if result.get("status") == "completed":
                 outputs = result.get("outputs") if isinstance(result.get("outputs"), list) else []
                 image = next((item for item in outputs if isinstance(item, Mapping) and item.get("kind") == "images"), None)
                 if image:
                     url = str(image.get("url") or "")
-                    path = await self.materialize(url, spec.request_id) if self.materialize and url else url
+                    try:
+                        path = await self.materialize(url, spec.request_id) if self.materialize and url else url
+                    except Exception as exc:
+                        self._debug_emit(
+                            "result_materialization",
+                            status="failed",
+                            data={"task_id": task_id, "url": url},
+                            payloads={"response": result, "exception": {"type": type(exc).__name__, "message": str(exc)}},
+                            error=exc,
+                        )
+                        raise
                     trace.append({
                         "stage": "result",
                         "at": time.time(),
                         "data": {"task_id": task_id, "materialized": bool(path)},
                     })
+                    self._debug_emit(
+                        "result_materialization",
+                        status="ok",
+                        data={"task_id": task_id, "materialized": True},
+                        payloads={"response": result, "materialized": {"path": path}},
+                    )
                     return GenerationResultV1(
                         request_id=spec.request_id, task_id=task_id, backend=self.backend,
                         model_profile=prompt.model_profile, workflow=route.key.workflow,
@@ -256,8 +360,15 @@ class ComfyUIServiceAdapter:
                         degraded_capabilities=references.degraded_capabilities, generation_completed=True,
                         trace=tuple(trace),
                     )
+                self._debug_emit(
+                    "result_materialization",
+                    status="warning",
+                    data={"task_id": task_id, "reason": "completed_without_image"},
+                    payloads={"response": result},
+                )
             await asyncio.sleep(self.poll_interval)
-        await self.service.cancel(task_id)
+        cancelled = await self.service.cancel(task_id)
+        self._debug_emit("backend_cancel", status="warning", data={"task_id": task_id}, payloads={"response": cancelled})
         return GenerationResultV1(
             request_id=spec.request_id, task_id=task_id, backend=self.backend,
             model_profile=prompt.model_profile, workflow=route.key.workflow,
@@ -275,6 +386,41 @@ class OnlineEndpointAdapter:
     ) -> None:
         self.endpoints = {str(key): dict(value) for key, value in endpoints.items()}
         self.execute = execute
+        self._debug_recorder: Any = None
+        self._debug_trace_id = ""
+
+    def bind_debug(self, recorder: Any, trace_id: str) -> None:
+        binding = (recorder, str(trace_id or ""))
+        _DEBUG_BINDING.set(binding)
+        self._debug_recorder, self._debug_trace_id = binding
+
+    def clear_debug(self) -> None:
+        _DEBUG_BINDING.set(None)
+
+    def _debug_emit(
+        self,
+        stage: str,
+        *,
+        status: str = "ok",
+        data: Mapping[str, Any] | None = None,
+        payloads: Mapping[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        binding = _DEBUG_BINDING.get()
+        if binding is None:
+            return
+        recorder, trace_id = binding
+        if not trace_id or not callable(getattr(recorder, "emit", None)):
+            return
+        try:
+            recorder.emit(trace_id, stage, status=status, data=data, payloads=payloads, error=error)
+        except TypeError:
+            try:
+                recorder.emit(trace_id, stage, status=status, data=data, error=error)
+            except Exception:
+                return
+        except Exception:
+            return
 
     async def capabilities(self, route: RouteDefinition) -> BackendCapabilitiesV1:
         return endpoint_capabilities(self.endpoints.get(route.key.workflow, {}))
@@ -283,6 +429,21 @@ class OnlineEndpointAdapter:
         endpoint = self.endpoints.get(route.key.workflow)
         if endpoint is None:
             return GenerationResultV1(request_id=spec.request_id, backend=self.backend, error_code="route_unavailable", failure_stage="route")
+        request_payload = {
+            "backend": self.backend,
+            "endpoint": endpoint,
+            "operation": spec.operation,
+            "prompt": asdict(prompt),
+            "references": [
+                {
+                    "reference_id": item.reference_id,
+                    "path": item.path,
+                    "roles": list(item.roles),
+                }
+                for item in references.submitted
+            ],
+        }
+        self._debug_emit("backend_request", data={"kind": "external_submit", "endpoint": route.key.workflow}, payloads={"request": request_payload})
         trace.append({
             "stage": "submission",
             "at": time.time(),
@@ -292,7 +453,23 @@ class OnlineEndpointAdapter:
                 "reference_count": len(references.submitted),
             },
         })
-        outcome = await self.execute(endpoint, prompt, references.submitted)
+        try:
+            outcome = await self.execute(endpoint, prompt, references.submitted)
+        except Exception as exc:
+            self._debug_emit(
+                "backend_response",
+                status="failed",
+                data={"kind": "external_submit", "endpoint": route.key.workflow},
+                payloads={"request": request_payload, "exception": {"type": type(exc).__name__, "message": str(exc)}},
+                error=exc,
+            )
+            raise
+        self._debug_emit(
+            "backend_response",
+            status="ok" if isinstance(outcome, Mapping) and not outcome.get("error_code") else "failed",
+            data={"kind": "external_result", "endpoint": route.key.workflow},
+            payloads={"request": request_payload, "response": outcome},
+        )
         trace.append({
             "stage": "result",
             "at": time.time(),

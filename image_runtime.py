@@ -31,7 +31,7 @@ from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -240,6 +240,7 @@ from .generation_contracts import (
     WeatherFactsV1,
 )
 from .generation_engine import CircuitBreaker, GenerationEngine
+from .generation_debug import GenerationDebugConfig, GenerationDebugRecorder
 from .generation_profiles import (
     FRONT_FACING_CAMERA_PORTRAIT,
     SELFIE_UI_NEGATIVE_TERMS,
@@ -256,6 +257,10 @@ _MINIMAX_REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 _EXTERNAL_IMAGE_DOWNLOAD_TIMEOUT_OVERRIDE: ContextVar[float | None] = ContextVar(
     "private_companion_external_image_download_timeout_override",
+    default=None,
+)
+_PHOTO_DEBUG_TRACE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "private_companion_photo_debug_trace_context",
     default=None,
 )
 from .proactive_routes import PROACTIVE_ROUTE_REGISTRY
@@ -9715,14 +9720,53 @@ Output:
         status: str = "ok",
         data: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
+        payloads: Mapping[str, Any] | None = None,
     ) -> None:
         try:
-            max_bytes = self._photo_generation_trace_max_bytes()
-            if max_bytes <= 0:
-                return
             normalized_trace = _single_line(trace_id, 80)
             normalized_stage = _single_line(stage, 80)
             if not normalized_trace or not normalized_stage:
+                return
+            recorder = None
+            recorder_getter = getattr(self, "_generation_debug_recorder", None)
+            if callable(recorder_getter):
+                try:
+                    service = getattr(self, "_image_service", None)
+                    recorder = recorder_getter(getattr(service, "config", {}) or {})
+                    if recorder is not None and recorder.get_trace_state(normalized_trace) is None:
+                        recorder.start_trace(
+                            normalized_trace,
+                            request_id=normalized_trace,
+                            context=context or {},
+                        )
+                    if recorder is not None:
+                        recorder.emit(
+                            normalized_trace,
+                            normalized_stage,
+                            status=status,
+                            request_id=normalized_trace,
+                            data=data or {},
+                            context=context or {},
+                            payloads=payloads,
+                        )
+                except Exception:
+                    recorder = None
+            if recorder is not None:
+                # Bind the recorder to the current async generation task so
+                # provider-specific HTTP calls can share the legacy trace.
+                _PHOTO_DEBUG_TRACE_CONTEXT.set(
+                    {
+                        "owner": self,
+                        "trace_id": normalized_trace,
+                        "recorder": recorder,
+                    }
+                )
+            if normalized_stage in {"completed", "failed", "delivery_completed", "delivery_failed"}:
+                binding = _PHOTO_DEBUG_TRACE_CONTEXT.get()
+                if isinstance(binding, dict) and binding.get("owner") is self and binding.get("trace_id") == normalized_trace:
+                    _PHOTO_DEBUG_TRACE_CONTEXT.set(None)
+            max_bytes = self._photo_generation_trace_max_bytes()
+            if max_bytes <= 0:
                 return
             now = _now_ts()
             states = getattr(self, "_photo_generation_trace_states", None)
@@ -9779,6 +9823,84 @@ Output:
                 "[PrivateCompanion] 记录生图可观测 trace 失败: %s",
                 _single_line(exc, 120),
             )
+
+    def _append_photo_generation_http_exchange(
+        self,
+        *,
+        method: str,
+        endpoint: str,
+        request_headers: Mapping[str, Any] | None = None,
+        request_query: Mapping[str, Any] | None = None,
+        request_body: Any = None,
+        response_status: int | None = None,
+        response_headers: Mapping[str, Any] | None = None,
+        response_body: Any = None,
+        stage: str = "http_exchange",
+        task_id: str = "",
+        poll: bool = False,
+        attempt: int | str | None = None,
+        session_key: str = "",
+        backend: str = "external",
+        model: str = "",
+        error: Any = None,
+    ) -> None:
+        """Capture one real image-provider HTTP exchange on the active trace."""
+        try:
+            binding = _PHOTO_DEBUG_TRACE_CONTEXT.get()
+            if not isinstance(binding, dict) or binding.get("owner") is not self:
+                return
+            recorder = binding.get("recorder")
+            trace_id = _single_line(binding.get("trace_id"), 80)
+            emitter = getattr(recorder, "emit", None)
+            if not trace_id or not callable(emitter):
+                return
+            try:
+                normalized_status = int(response_status) if response_status is not None else 0
+            except (TypeError, ValueError):
+                normalized_status = 0
+            event_status = "failed" if normalized_status >= 400 else "error" if error else "ok"
+            request_meta = {
+                "method": _single_line(method, 20).upper(),
+                "endpoint": _single_line(endpoint, 2000),
+                "headers": dict(request_headers or {}),
+                "query": dict(request_query or {}),
+                "body": request_body,
+            }
+            response_meta = {
+                "status": normalized_status or None,
+                "headers": dict(response_headers or {}),
+                "body": response_body,
+            }
+            data = {
+                "method": request_meta["method"],
+                "endpoint": request_meta["endpoint"],
+                "query": request_meta["query"],
+                "http_status": normalized_status or None,
+                "request_headers": request_meta["headers"],
+                "response_headers": response_meta["headers"],
+                "task_id": _single_line(task_id, 240),
+                "poll": bool(poll),
+                "attempt": attempt,
+                "session_key": _single_line(session_key, 240),
+                "backend": _single_line(backend, 80),
+                "model": _single_line(model, 160),
+            }
+            payloads: dict[str, Any] = {"request": request_meta}
+            if response_status is not None or response_headers or response_body is not None:
+                payloads["response"] = response_meta
+            emitter(
+                trace_id,
+                _single_line(stage, 120) or "http_exchange",
+                status=event_status,
+                request_id=trace_id,
+                backend=backend,
+                data=data,
+                payloads=payloads,
+                error=error,
+            )
+        except Exception:
+            # Debug capture is strictly best effort and must never affect I/O.
+            return
 
     def _record_recent_photo_generation(
         self,
@@ -12353,6 +12475,16 @@ Output:
                 "sanitizer_version": resolved_context.sanitizer_version,
                 "workflow_fixed_prompt": workflow_fixed_prompt_audit,
             },
+            payloads={
+                "request": {
+                    "prompt": complete_prompt_text,
+                    "submitted_prompt": prompt_text,
+                    "local_backend_prompt": local_backend_prompt_text,
+                    "prompt_format": prompt_format,
+                    "image_size": image_size,
+                    "reference_image_paths": list(reference_image_paths),
+                },
+            },
         )
         if workflow_fixed_prompt_audit.get("configured"):
             logger.info(
@@ -12402,6 +12534,7 @@ Output:
                     "degraded_capabilities": list(unified_result.degraded_capabilities),
                     "trace": [dict(item) for item in unified_result.trace],
                 },
+                payloads={"response": asdict(unified_result)},
             )
         self._append_photo_generation_trace_event(
             trace_id,
@@ -12558,6 +12691,16 @@ Output:
                     "generation_completed": bool(generation_completed),
                     "failure_stage": _single_line(failure_stage, 60),
                 },
+                payloads={
+                    "result": {
+                        "backend": backend,
+                        "image_path": image_path,
+                        "note": note,
+                        "output_exists": output_exists,
+                        "generation_completed": bool(generation_completed),
+                        "failure_stage": _single_line(failure_stage, 60),
+                    }
+                },
             )
             self._record_recent_photo_generation(
                 trace_id=trace_id,
@@ -12619,6 +12762,17 @@ Output:
                     "failure_stage": _single_line(failure_stage, 60),
                 },
                 context={"backend": backend},
+                payloads={
+                    "result": {
+                        "backend": backend,
+                        "image_path": image_path,
+                        "note": note,
+                        "elapsed_ms": elapsed_ms,
+                        "output_exists": output_exists,
+                        "generation_completed": bool(generation_completed),
+                        "failure_stage": _single_line(failure_stage, 60),
+                    }
+                },
             )
             logger.info(
                 "[PrivateCompanion] 生图结束: trace=%s ok=%s backend=%s elapsed=%sms reference_used=%s note=%s %s",
@@ -17322,6 +17476,18 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 request_options["proxy"] = proxy_url
             async with session.get(request_target, **request_options) as response:
                 if response.status >= 400:
+                    self._append_photo_generation_http_exchange(
+                        method="GET",
+                        endpoint=target,
+                        request_headers=headers,
+                        request_body={"url": target},
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=None,
+                        stage="http_download",
+                        session_key=session_key,
+                        backend="external_download",
+                    )
                     logger.info(
                         "[PrivateCompanion] 下载在线生图结果失败: status=%s headers=%s url=%s",
                         response.status,
@@ -17363,6 +17529,31 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     return "", "下载图片为空"
                 await asyncio.to_thread(temporary_path.replace, output_path)
                 temporary_path = None
+            response_body: Any = {
+                "content_type": content_type,
+                "bytes": received_size,
+                "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+            }
+            binding = _PHOTO_DEBUG_TRACE_CONTEXT.get()
+            recorder = binding.get("recorder") if isinstance(binding, dict) else None
+            config = getattr(recorder, "config", None)
+            if (
+                bool(getattr(config, "capture_payloads", False))
+                and str(getattr(recorder, "effective_capture_mode", "")) == "full_with_secrets"
+            ):
+                response_body = output_path.read_bytes()
+            self._append_photo_generation_http_exchange(
+                method="GET",
+                endpoint=target,
+                request_headers=headers,
+                request_body={"url": target},
+                response_status=response.status,
+                response_headers=dict(response.headers),
+                response_body=response_body,
+                stage="http_download",
+                session_key=session_key,
+                backend="external_download",
+            )
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             logger.info(
                 "[PrivateCompanion] 下载在线生图结果完成: status=%s content_type=%s bytes=%s elapsed=%sms reused=%s proxy=%s env_proxy=%s timeout=%ss url=%s",
@@ -17385,6 +17576,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             await self._maybe_cleanup_generated_photos(protected_path=output_path)
             return str(output_path), "ok"
         except asyncio.TimeoutError:
+            self._append_photo_generation_http_exchange(
+                method="GET",
+                endpoint=target,
+                request_headers=locals().get("headers", {}),
+                request_body={"url": target},
+                stage="http_download",
+                session_key=session_key,
+                backend="external_download",
+                error="timeout",
+            )
             note = f"下载在线图片结果超时（{download_timeout} 秒内未完成），请检查运行 Bot 的服务器是否能直连该图片 URL"
             logger.info(
                 "[PrivateCompanion] 下载在线生图结果超时: url=%s note=%s",
@@ -17394,6 +17595,27 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            response_obj = locals().get("response")
+            try:
+                response_status = getattr(response_obj, "status", None)
+            except Exception:
+                response_status = None
+            try:
+                response_headers = dict(getattr(response_obj, "headers", {}) or {})
+            except Exception:
+                response_headers = {}
+            self._append_photo_generation_http_exchange(
+                method="GET",
+                endpoint=target,
+                request_headers=locals().get("headers", {}),
+                request_body={"url": target},
+                response_status=response_status,
+                response_headers=response_headers,
+                stage="http_exception",
+                session_key=session_key,
+                backend="external_download",
+                error={"type": type(e).__name__, "message": safe_error},
+            )
             logger.warning("[PrivateCompanion] 下载在线生图结果失败: %s", safe_error)
             return "", safe_error
         finally:
@@ -17450,6 +17672,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(endpoint, headers=headers, json=payload) as response:
                     text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_submit",
+                        session_key=session_key,
+                        backend="bailian",
+                        model=self.external_image_api_model,
+                    )
                     logger.info(
                         "[PrivateCompanion] 百炼多模态生图响应: status=%s chars=%s preview=%s",
                         response.status,
@@ -17489,8 +17724,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         success_note=note,
                     )
             return "", "百炼多模态生图未返回图片地址"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(label="百炼多模态生图接口")
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="bailian",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 百炼多模态生图超时: endpoint=%s model=%s timeout=%ss",
                 self._external_image_diagnostic_text(endpoint, 160),
@@ -17500,6 +17746,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="bailian",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 百炼多模态生图失败: %s", safe_error)
             return "", safe_error
 
@@ -17541,6 +17798,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     )
                     async with session.post(endpoint, headers=headers, json=payload) as response:
                         text = await response.text()
+                        self._append_photo_generation_http_exchange(
+                            method="POST",
+                            endpoint=endpoint,
+                            request_headers=headers,
+                            request_body=payload,
+                            response_status=response.status,
+                            response_headers=dict(response.headers),
+                            response_body=text,
+                            stage="http_submit",
+                            attempt=endpoint,
+                            session_key=session_key,
+                            backend="bailian",
+                            model=self.external_image_api_model,
+                        )
                         logger.info(
                             "[PrivateCompanion] 百炼异步生图响应: status=%s chars=%s preview=%s",
                             response.status,
@@ -17581,6 +17852,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     }
                     async with session.get(task_endpoint, headers=task_headers) as response:
                         text = await response.text()
+                        self._append_photo_generation_http_exchange(
+                            method="GET",
+                            endpoint=task_endpoint,
+                            request_headers=task_headers,
+                            response_status=response.status,
+                            response_headers=dict(response.headers),
+                            response_body=text,
+                            stage="http_poll",
+                            task_id=task_id,
+                            poll=True,
+                            session_key=session_key,
+                            backend="bailian",
+                            model=self.external_image_api_model,
+                        )
                         logger.info(
                             "[PrivateCompanion] 百炼任务查询响应: status=%s task=%s chars=%s preview=%s",
                             response.status,
@@ -17637,8 +17922,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             180,
                         )
                     await asyncio.sleep(2)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(label="百炼异步生图接口")
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=locals().get("endpoint") or (endpoints[0] if endpoints else ""),
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="bailian",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 百炼异步生图超时: model=%s timeout=%ss",
                 _single_line(self.external_image_api_model, 80),
@@ -17647,6 +17943,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=locals().get("endpoint") or (endpoints[0] if endpoints else ""),
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="bailian",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 百炼异步生图失败: %s", safe_error)
             return "", safe_error
 
@@ -17686,6 +17993,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 )
                 async with session.post(endpoint, headers=headers, json=payload) as response:
                     text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_submit",
+                        session_key=session_key,
+                        backend="modelscope",
+                        model=self.external_image_api_model,
+                    )
                     logger.info(
                         "[PrivateCompanion] 魔搭生图提交响应: status=%s chars=%s preview=%s",
                         response.status,
@@ -17720,6 +18040,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         return "", self._external_image_timeout_note(label="魔搭异步生图任务轮询")
                     async with session.get(task_endpoint, headers=headers) as response:
                         poll_text = await response.text()
+                        self._append_photo_generation_http_exchange(
+                            method="GET",
+                            endpoint=task_endpoint,
+                            request_headers=headers,
+                            response_status=response.status,
+                            response_headers=dict(response.headers),
+                            response_body=poll_text,
+                            stage="http_poll",
+                            task_id=task_id,
+                            poll=True,
+                            session_key=session_key,
+                            backend="modelscope",
+                            model=self.external_image_api_model,
+                        )
                         logger.info(
                             "[PrivateCompanion] 魔搭任务查询响应: status=%s task=%s chars=%s preview=%s",
                             response.status,
@@ -17755,8 +18089,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         )
                         return "", _single_line(message or "魔搭异步生图任务失败", 180)
                     await asyncio.sleep(2)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(label="魔搭异步生图接口")
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="modelscope",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 魔搭异步生图超时: model=%s timeout=%ss",
                 _single_line(self.external_image_api_model, 80),
@@ -17765,6 +18110,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="modelscope",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 魔搭异步生图失败: %s", safe_error)
             return "", safe_error
 
@@ -17802,6 +18158,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(endpoint, headers=headers, json=payload) as response:
                     text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_submit",
+                        session_key=session_key,
+                        backend="doubao",
+                        model=self.external_image_api_model,
+                    )
                     logger.info(
                         "[PrivateCompanion] 豆包/火山方舟生图响应: status=%s chars=%s preview=%s",
                         response.status,
@@ -17820,8 +18189,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     success_note="ok",
                 )
             return "", "豆包/火山方舟生图未返回图片数据"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(label="豆包/火山方舟生图接口")
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="doubao",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 豆包/火山方舟生图超时: model=%s timeout=%ss",
                 _single_line(self.external_image_api_model, 80),
@@ -17830,6 +18210,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="doubao",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 豆包/火山方舟生图失败: %s", safe_error)
             return "", safe_error
 
@@ -17914,6 +18305,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             ) as session:
                 async with session.post(endpoint, **request_options) as response:
                     text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_query=query,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_submit",
+                        session_key=session_key,
+                        backend="gemini",
+                        model=self.external_image_api_model,
+                    )
                     logger.info(
                         "[PrivateCompanion] Gemini 生图响应: status=%s chars=%s preview=%s",
                         response.status,
@@ -17967,8 +18372,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 )
             message = self._external_payload_first_value(data, ("message", "error", "error_message", "finishReason", "finish_reason"))
             return "", _single_line(message or "Gemini 生图未返回图片内容", 180)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(label="Gemini 生图接口")
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="gemini",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] Gemini 生图超时: model=%s timeout=%ss",
                 _single_line(self.external_image_api_model, 80),
@@ -17977,6 +18393,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="gemini",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] Gemini 生图失败: %s", safe_error)
             return "", safe_error
 
@@ -18358,6 +18785,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     )
                     async with session.post(candidate, headers=headers, json=payload) as response:
                         text = await response.text()
+                        self._append_photo_generation_http_exchange(
+                            method="POST",
+                            endpoint=candidate,
+                            request_headers=headers,
+                            request_body=payload,
+                            response_status=response.status,
+                            response_headers=dict(response.headers),
+                            response_body=text,
+                            stage="http_submit",
+                            attempt=attempt + 1,
+                            session_key=session_key,
+                            backend="agnes",
+                            model=model,
+                        )
                         response_preview = re.sub(
                             r'("b64_json"\s*:\s*")[^"]+',
                             r'\1[base64 omitted]',
@@ -18402,10 +18843,32 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         return replace(materialized, note=detail)
                     return materialized
             return "", last_error or "Agnes Image 未返回数据"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=locals().get("candidate") or locals().get("endpoint") or "",
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="agnes",
+                model=locals().get("model") or self.external_image_api_model,
+                error=exc,
+            )
             return "", self._external_image_timeout_note(reference=bool(reference_image_path))
         except Exception as exc:
             safe_error = self._external_image_diagnostic_text(exc, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=locals().get("candidate") or locals().get("endpoint") or "",
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="agnes",
+                model=locals().get("model") or self.external_image_api_model,
+                error=exc,
+            )
             logger.warning("[PrivateCompanion] Agnes Image 生图失败: %s", safe_error)
             return "", safe_error
 
@@ -18563,6 +19026,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     )
                     async with session.post(endpoint, headers=headers, json=payload) as response:
                         text = await response.text()
+                        self._append_photo_generation_http_exchange(
+                            method="POST",
+                            endpoint=endpoint,
+                            request_headers=headers,
+                            request_body=payload,
+                            response_status=response.status,
+                            response_headers=dict(response.headers),
+                            response_body=text,
+                            stage="http_submit",
+                            attempt=attempt + 1,
+                            session_key=session_key,
+                            backend="minimax",
+                            model=self.external_image_api_model,
+                        )
                         response_preview = re.sub(
                             r'("image_base64"\s*:\s*\[\s*")[^"]+',
                             r'\1[base64 omitted]',
@@ -18638,10 +19115,32 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         )
                     return "", last_note or "MiniMax 图片结果解析失败"
             return "", last_note or "MiniMax 图片接口未返回数据"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="minimax",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             return "", self._external_image_timeout_note(reference=bool(reference_image_path))
         except Exception as exc:
             safe_error = self._external_image_diagnostic_text(exc, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="minimax",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.warning("[PrivateCompanion] MiniMax 图片生成失败: %s", safe_error)
             return "", safe_error
 
@@ -18859,6 +19358,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         )
                         async with session.post(candidate_endpoint, headers=headers, json=payload) as response:
                             text = await response.text()
+                            self._append_photo_generation_http_exchange(
+                                method="POST",
+                                endpoint=candidate_endpoint,
+                                request_headers=headers,
+                                request_body=payload,
+                                response_status=response.status,
+                                response_headers=dict(response.headers),
+                                response_body=text,
+                                stage="http_submit",
+                                attempt=attempt + 1,
+                                session_key=session_key,
+                                backend=platform or "external",
+                                model=self.external_image_api_model,
+                            )
                             logger.info(
                                 "[PrivateCompanion] 在线图片 API 生图响应: endpoint=%s status=%s chars=%s preview=%s",
                                 self._external_image_diagnostic_text(candidate_endpoint, 160),
@@ -18904,8 +19417,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 )
                 return materialized
             return "", "在线图片 API 未返回 url 或 b64_json"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note()
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend=platform or "external",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 在线图片 API 生图超时: endpoint=%s model=%s timeout=%ss",
                 self._external_image_diagnostic_text(endpoint, 160),
@@ -18915,6 +19439,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend=platform or "external",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 在线图片 API 生图失败: %s", safe_error)
             return "", safe_error
 
@@ -19043,6 +19578,34 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         )
                         async with session.post(candidate_endpoint, headers=headers, **request_data) as response:
                             text = await response.text()
+                            capture_body: Any = openrouter_payload if use_openrouter_json else {
+                                "model": self.external_image_api_model,
+                                "prompt": submitted_prompt_text,
+                                "size": self._sanitize_external_image_size(image_size),
+                                "multipart_reference_count": len(image_payloads),
+                                "multipart_reference_bytes": [
+                                    {
+                                        "filename": f"reference_{index}{path.suffix.lower()}",
+                                        "content_type": content_type,
+                                        "bytes": image_bytes,
+                                    }
+                                    for index, (path, image_bytes, content_type) in enumerate(image_payloads, start=1)
+                                ],
+                            }
+                            self._append_photo_generation_http_exchange(
+                                method="POST",
+                                endpoint=candidate_endpoint,
+                                request_headers=headers,
+                                request_body=capture_body,
+                                response_status=response.status,
+                                response_headers=dict(response.headers),
+                                response_body=text,
+                                stage="http_edit",
+                                attempt=attempt + 1,
+                                session_key=session_key,
+                                backend=platform or "external",
+                                model=self.external_image_api_model,
+                            )
                             logger.info(
                                 "[PrivateCompanion] 在线图片 API 参考图响应: endpoint=%s status=%s chars=%s preview=%s",
                                 self._external_image_diagnostic_text(candidate_endpoint, 160),
@@ -19097,8 +19660,19 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     )
                 return materialized
             return "", "参考图接口未返回 url 或 b64_json"
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             note = self._external_image_timeout_note(reference=True)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("openrouter_payload") or locals().get("capture_body"),
+                stage="http_exception",
+                session_key=session_key,
+                backend=platform or "external",
+                model=self.external_image_api_model,
+                error=exc,
+            )
             logger.info(
                 "[PrivateCompanion] 在线图片 API 参考图生图超时: endpoint=%s model=%s timeout=%ss reference=%s",
                 self._external_image_diagnostic_text(endpoint, 160),
@@ -19109,6 +19683,17 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             return "", note
         except Exception as e:
             safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("openrouter_payload") or locals().get("capture_body"),
+                stage="http_exception",
+                session_key=session_key,
+                backend=platform or "external",
+                model=self.external_image_api_model,
+                error=e,
+            )
             logger.warning("[PrivateCompanion] 在线图片 API 参考图生图失败: %s", safe_error)
             return "", safe_error
 
@@ -19193,6 +19778,54 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
     def _unified_scene_field(pattern: str, context: str, limit: int) -> str:
         match = re.search(pattern, str(context or ""), flags=re.I)
         return _single_line(match.group(1) if match else "", limit)
+
+    def _generation_debug_recorder(self, config: Any) -> GenerationDebugRecorder | None:
+        """Return the shared recorder for unified-engine attempts.
+
+        The legacy trace size remains the compatibility switch. New installs
+        can use ``debug`` under the image configuration without changing the
+        existing host settings.
+        """
+        service = getattr(self, "_image_service", None)
+        owner_config = config if isinstance(config, dict) else {}
+        raw_debug = owner_config.get("debug") if isinstance(owner_config.get("debug"), dict) else {}
+        if not raw_debug:
+            raw_debug = owner_config.get("image_debug") if isinstance(owner_config.get("image_debug"), dict) else {}
+        if not raw_debug and isinstance(owner_config.get("image"), dict):
+            raw_debug = owner_config["image"].get("debug") if isinstance(owner_config["image"].get("debug"), dict) else {}
+        legacy_kb = _safe_int(getattr(self, "photo_generation_trace_max_size_kb", 0), 0, 0)
+        raw_enabled = raw_debug.get("enabled", legacy_kb > 0)
+        if isinstance(raw_enabled, str):
+            enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        else:
+            enabled = bool(raw_enabled)
+        mode = str(raw_debug.get("capture_mode", raw_debug.get("mode", "redacted")) or "redacted")
+        if not enabled:
+            return None
+        default_kb = max(legacy_kb, 10240)
+        options = dict(raw_debug)
+        options.setdefault("enabled", True)
+        options.setdefault("max_file_size_kb", default_kb)
+        options.setdefault("backup_count", _safe_int(getattr(self, "photo_generation_trace_backup_count", 5), 5, 0))
+        options.setdefault("capture_mode", mode)
+        key = "unified_generation_debug_recorder"
+        data_dir = str(getattr(self, "data_dir", "") or getattr(service, "data_dir", "") or ".")
+        normalized_config = GenerationDebugConfig.from_mapping(options)
+        cache_owner = service if service is not None else self
+        fingerprint = (data_dir, normalized_config)
+        cached = getattr(cache_owner, key, None)
+        if (
+            isinstance(cached, GenerationDebugRecorder)
+            and getattr(cache_owner, f"{key}_fingerprint", None) == fingerprint
+        ):
+            return cached
+        recorder = GenerationDebugRecorder(
+            data_dir,
+            normalized_config,
+        )
+        setattr(cache_owner, key, recorder)
+        setattr(cache_owner, f"{key}_fingerprint", fingerprint)
+        return recorder
 
     async def _run_unified_generation_engine(
         self,
@@ -19469,6 +20102,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             prompt_cache=prompt_cache,
             circuit_breaker=circuit_breaker,
             route_semaphores=route_semaphores,
+            debug_recorder=self._generation_debug_recorder(config),
         )
         return await engine.generate(spec, route.name)
 

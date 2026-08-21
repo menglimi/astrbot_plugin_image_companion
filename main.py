@@ -100,6 +100,24 @@ class ImageCompanionExtensionAPI:
     def status(self) -> dict[str, Any]:
         return self._plugin.status()
 
+    def debug_data_dirs(self, owner: Any = None) -> list[str]:
+        """Return the data roots used by the image runtime's debug recorder.
+
+        The split plugin can either reuse the companion data directory or own
+        a separate one.  Exposing the resolved candidates keeps the companion
+        page from guessing which root contains the current trace.
+        """
+        owner_dir = str(getattr(owner, "data_dir", "") or "").strip()
+        service_dir = str(getattr(self._plugin, "data_dir", "") or "").strip()
+        candidates = []
+        if self._plugin.reuse_private_companion_assets and owner_dir:
+            candidates.append(owner_dir)
+        if service_dir:
+            candidates.append(service_dir)
+        if owner_dir:
+            candidates.append(owner_dir)
+        return list(dict.fromkeys(candidates))
+
     def _host_available(self) -> bool:
         return self._plugin._private_companion_api() is not None
 
@@ -496,6 +514,38 @@ class ImageCompanionPlugin(Star):
     def status(self) -> dict[str, Any]:
         metrics = getattr(self, "generation_metrics", None)
         managed = self._private_companion_api() is not None
+        raw_debug = self.config.get("debug") if isinstance(self.config, dict) and isinstance(self.config.get("debug"), dict) else {}
+        if not raw_debug and isinstance(self.config, dict) and isinstance(self.config.get("image"), dict):
+            raw_debug = self.config["image"].get("debug") if isinstance(self.config["image"].get("debug"), dict) else {}
+        legacy_trace_enabled = False
+        if not raw_debug:
+            try:
+                legacy_trace_enabled = int(self.image_setting("photo_generation_trace_max_size_kb", 0) or 0) > 0
+            except (TypeError, ValueError):
+                legacy_trace_enabled = False
+        debug_mode = str(
+            raw_debug.get("capture_mode", raw_debug.get("mode", "redacted" if legacy_trace_enabled else "off"))
+            or ("redacted" if legacy_trace_enabled else "off")
+        ).strip().lower()
+        raw_debug_enabled = raw_debug.get("enabled", legacy_trace_enabled)
+        debug_enabled = (
+            raw_debug_enabled.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            if isinstance(raw_debug_enabled, str)
+            else bool(raw_debug_enabled)
+        )
+        raw_include_secrets = raw_debug.get("include_secrets", False)
+        include_secrets = (
+            raw_include_secrets.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            if isinstance(raw_include_secrets, str)
+            else bool(raw_include_secrets)
+        )
+        debug_status = {
+            "enabled": debug_enabled and debug_mode != "off",
+            "capture_mode": debug_mode,
+            "include_secrets": include_secrets,
+            "sensitive": debug_mode == "full_with_secrets" and include_secrets,
+            "legacy_compatibility": legacy_trace_enabled,
+        }
         return {
             "installed": True,
             "enabled": self.enabled,
@@ -507,6 +557,7 @@ class ImageCompanionPlugin(Star):
             "reuse_private_companion_assets": self.reuse_private_companion_assets,
             "generation_count": self.generation_count,
             "last_generation": copy.deepcopy(self.last_generation),
+            "debug": debug_status,
             "unified_engine": route_diagnostics(getattr(self, "config", {}) or {}),
             "metrics": metrics.snapshot() if callable(getattr(metrics, "snapshot", None)) else {},
         }

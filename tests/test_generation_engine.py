@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from generation_engine import (  # noqa: E402
     route_cache_key,
 )
 from generation_adapters import LegacyCallbackAdapter  # noqa: E402
+from generation_debug import GenerationDebugConfig, GenerationDebugRecorder  # noqa: E402
 from generation_profiles import (  # noqa: E402
     AnimaPromptCompiler,
     FRONT_FACING_CAMERA_PORTRAIT,
@@ -231,6 +233,32 @@ class ContractAndCompilerTests(unittest.TestCase):
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_debug_events_reuse_request_trace_id_when_legacy_state_exists(self):
+        routes = RouteRegistry()
+        routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie", "wf")))
+        adapter = _Adapter("comfyui")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = GenerationDebugRecorder(
+                temp_dir,
+                GenerationDebugConfig(enabled=True, capture_mode="full"),
+            )
+            recorder.start_trace("engine-trace", request_id="engine-trace")
+            recorder.emit("engine-trace", "legacy_context")
+            result = await GenerationEngine(
+                default_model_profile_registry(),
+                routes,
+                {"comfyui": adapter},
+                debug_recorder=recorder,
+            ).generate(_spec(request_id="engine-trace"), "route")
+
+            self.assertTrue(result.ok)
+            events = recorder.read_events(trace_id="engine-trace")
+            self.assertTrue(events)
+            self.assertTrue(all(event["trace_id"] == "engine-trace" for event in events))
+            self.assertEqual([event["seq"] for event in events], list(range(1, len(events) + 1)))
+            self.assertTrue(any(event["stage"] == "engine_completed" for event in events))
+            self.assertFalse(any(event["stage"] == "completed" for event in events))
+
     async def test_invalid_context_is_returned_as_classified_failure(self):
         routes = RouteRegistry()
         routes.register(RouteDefinition("route", RouteKey("comfyui", "anima", "selfie", "wf")))
