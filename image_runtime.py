@@ -12,6 +12,7 @@ import gc
 import hashlib
 import html
 import importlib
+import inspect
 import json
 import math
 import os
@@ -16039,7 +16040,20 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 _single_line(prompt_text, 180),
                 len(str(positive_prompt or "")),
             )
-            response = await plugin._call_t2i_api(positive_prompt)
+            # SDGen releases differ here: older versions return a coroutine,
+            # while newer ones expose progress through an async generator.
+            # Consume either form at the integration boundary so one plugin
+            # version cannot leak ``await async_generator`` into the request.
+            result = plugin._call_t2i_api(positive_prompt)
+            while inspect.isawaitable(result):
+                result = await result
+            if hasattr(result, "__aiter__"):
+                response = None
+                async for update in result:
+                    if update is not None:
+                        response = update
+            else:
+                response = result
             images = response.get("images") if isinstance(response, dict) else None
             if not isinstance(images, list) or not images:
                 logger.info("[PrivateCompanion] SDGen 生图未返回图片: response_type=%s", type(response).__name__)
