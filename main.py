@@ -20,7 +20,7 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
