@@ -12546,21 +12546,35 @@ Output:
         )
         preferred = self.photo_generation_backend
         unified_result = None
-        if not missing_identity_reference:
-            unified_result = await self._run_unified_generation_engine(
-                workflow_kind=workflow_kind,
-                request_id=trace_id,
-                request_text=current_user_request or original_prompt_text,
-                legacy_prompt=local_backend_prompt_text,
-                scene_context=scene_context_after or scene_context_before,
-                wardrobe=wardrobe,
-                ambient_policy=ambient_wardrobe_policy,
-                reference_entries=submitted_reference_entries,
-                session_key=session_key,
-                managed_reference_gate=structured_reference_gate,
-                managed_reference_plan=structured_reference_plan,
-                structured_outfit=structured_outfit,
+        if missing_identity_reference:
+            logger.info(
+                "[PrivateCompanion] 未找到身份参考图，按提示词人物描述继续生成: trace=%s kind=%s",
+                trace_id,
+                _single_line(workflow_kind, 40),
             )
+            self._append_photo_generation_trace_event(
+                trace_id,
+                "identity_reference_fallback",
+                status="degraded",
+                data={
+                    "reason": "identity_reference_unavailable",
+                    "fallback": "prompt_only_generation",
+                },
+            )
+        unified_result = await self._run_unified_generation_engine(
+            workflow_kind=workflow_kind,
+            request_id=trace_id,
+            request_text=current_user_request or original_prompt_text,
+            legacy_prompt=local_backend_prompt_text,
+            scene_context=scene_context_after or scene_context_before,
+            wardrobe=wardrobe,
+            ambient_policy=ambient_wardrobe_policy,
+            reference_entries=submitted_reference_entries,
+            session_key=session_key,
+            managed_reference_gate=structured_reference_gate,
+            managed_reference_plan=structured_reference_plan,
+            structured_outfit=structured_outfit,
+        )
         if unified_result is not None:
             self._append_photo_generation_trace_event(
                 trace_id,
@@ -12838,13 +12852,6 @@ Output:
                 "上下文清理",
                 "",
                 "生图上下文仍存在未能安全清理的服装冲突，已停止调用后端",
-            )
-
-        if missing_identity_reference:
-            return finish(
-                "参考图",
-                "",
-                "本次人物画面需要可用的身份参考图，当前未找到，已停止无参考图生成人物。",
             )
 
         if unified_result is not None:
