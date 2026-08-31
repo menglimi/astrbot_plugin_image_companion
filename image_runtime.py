@@ -23121,6 +23121,29 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
             pass
         return None
 
+    def _external_photo_available(self) -> bool:
+        """Check this runtime's endpoint queue without re-entering its owner."""
+        try:
+            return bool(self._external_image_api_endpoint_queue())
+        except Exception:
+            return False
+
+    def _backup_external_photo_available(self) -> bool:
+        return not bool(self._backup_external_unavailable_note())
+
+    def _comfyui_photo_available(self) -> bool:
+        workflows_configured = bool(
+            getattr(self, "comfyui_text2img_workflow_name", "")
+            or getattr(self, "comfyui_selfie_workflow_name", "")
+        )
+        return workflows_configured and self._get_comfyui_module() is not None
+
+    def _sdgen_photo_available(self) -> bool:
+        return self._find_sdgen_plugin() is not None
+
+    def _custom_tool_photo_available(self) -> bool:
+        return self._find_custom_photo_tool_handler() is not None
+
     def _backup_external_unavailable_note(self) -> str:
         endpoints = getattr(self, "external_image_api_endpoints", [])
         if isinstance(endpoints, list) and endpoints:
@@ -23151,23 +23174,18 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
 
     def capability_status(self) -> dict[str, Any]:
         selected = _single_line(getattr(self, "photo_generation_backend", "auto"), 30) or "auto"
-        comfyui = bool(
-            (getattr(self, "comfyui_text2img_workflow_name", "") or getattr(self, "comfyui_selfie_workflow_name", ""))
-            and self._get_comfyui_module() is not None
-        )
-        sdgen = self._find_sdgen_plugin() is not None
-        try:
-            external = bool(self._external_image_api_endpoint_queue())
-        except Exception:
-            external = False
+        comfyui = self._comfyui_photo_available()
+        sdgen = self._sdgen_photo_available()
+        external = self._external_photo_available()
         backup_note = self._backup_external_unavailable_note()
-        external = external or not bool(backup_note)
-        tool_call = self._find_custom_photo_tool_handler() is not None
+        backup_external = self._backup_external_photo_available()
+        external = external or backup_external
+        tool_call = self._custom_tool_photo_available()
         backends = {
             "comfyui": comfyui,
             "sdgen": sdgen,
             "external": external,
-            "backup_external": not bool(backup_note),
+            "backup_external": backup_external,
             "tool_call": tool_call,
         }
         available = (
