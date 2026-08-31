@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
+import os
 import sys
+import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,7 +24,7 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.3.3"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
@@ -96,6 +100,105 @@ class ImageCompanionExtensionAPI:
 
     def __init__(self, plugin: "ImageCompanionPlugin") -> None:
         self._plugin = plugin
+        self._instance_generation = int(time.time_ns() % 2_000_000_000) or 1
+        self._reference_leases: dict[str, dict[str, Any]] = {}
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "plugin_id": PLUGIN_NAME,
+            "instance_generation": self._instance_generation,
+            "api_family": "image.generation",
+            "api_version": "image.generation-api.v1",
+            "supported_task_versions": ["image.task.v1"],
+            "capabilities": [
+                "image.build-task", "image.validate-task", "image.import-references",
+                "image.release-reference-import", "image.execute-task", "image.execute-task.active",
+            ],
+            "lifecycle_state": "ready",
+            "degraded_reasons": [],
+        }
+
+    def versions(self) -> dict[str, Any]:
+        return {
+            "plugin_id": PLUGIN_NAME,
+            "instance_generation": self._instance_generation,
+            "api_family": "image.generation",
+            "api_version": "image.generation-api.v1",
+            "task_version": "image.task.v1",
+            "supported_task_versions": ["image.task.v1"],
+        }
+
+    def build_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        value = dict(payload or {})
+        return {
+            "version": "image.task.v1",
+            "operation": "generate",
+            "workflow_kind": str(value.get("workflow_kind") or "text2img"),
+            "input": value,
+            "instance_generation": self._instance_generation,
+        }
+
+    def validate_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        valid = (
+            isinstance(task, dict) and task.get("version") == "image.task.v1"
+            and task.get("operation") == "generate"
+            and isinstance(task.get("workflow_kind"), str)
+            and isinstance(task.get("input"), dict)
+            and task.get("instance_generation") == self._instance_generation
+        )
+        return {"valid": valid, "task_version": "image.task.v1", "operation": "generate", "workflow_kind": str(task.get("workflow_kind") or "") if isinstance(task, dict) else ""}
+
+    async def import_references(self, payload: dict[str, Any]) -> dict[str, Any]:
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        base = {"result_version": "image.reference-import-result.v1", "instance_generation": self._instance_generation, "ttl_seconds": 90}
+        if not isinstance(assets, list) or not assets or len(assets) > 4:
+            return {**base, "status": "failed", "lease_id": None, "asset_ids": [], "error": {"code": "reference_import_invalid"}}
+        root = Path(self._plugin.data_dir) / "reference_imports"
+        root.mkdir(parents=True, exist_ok=True)
+        lease_id = "reflease_" + uuid.uuid4().hex[:48]
+        asset_ids: list[str] = []
+        paths: list[str] = []
+        try:
+            for item in assets:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, (bytes, bytearray)) or not content:
+                    raise ValueError("invalid reference")
+                asset_id = "ref_" + uuid.uuid4().hex[:48]
+                path = root / f"{asset_id}.bin"
+                path.write_bytes(bytes(content))
+                asset_ids.append(asset_id)
+                paths.append(str(path))
+            self._reference_leases[lease_id] = {"asset_ids": asset_ids, "paths": paths}
+            return {**base, "status": "succeeded", "lease_id": lease_id, "asset_ids": asset_ids, "error": None}
+        except Exception:
+            for path in paths:
+                try: Path(path).unlink(missing_ok=True)
+                except OSError: pass
+            return {**base, "status": "failed", "lease_id": None, "asset_ids": [], "error": {"code": "reference_import_failed"}}
+
+    def release_reference_import(self, lease_id: str) -> bool:
+        lease = self._reference_leases.pop(str(lease_id or ""), None)
+        if not isinstance(lease, dict): return False
+        for path in lease.get("paths", []):
+            try: Path(path).unlink(missing_ok=True)
+            except OSError: pass
+        return True
+
+    async def execute_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        request = dict(task.get("input") or {}) if isinstance(task, dict) else {}
+        asset_ids = request.get("reference_asset_ids") or []
+        for lease in self._reference_leases.values():
+            if set(asset_ids).issubset(set(lease.get("asset_ids", []))):
+                request["reference_image_paths"] = [path for asset_id, path in zip(lease.get("asset_ids", []), lease.get("paths", [])) if asset_id in asset_ids]
+                break
+        owner = request.pop("_owner", None)
+        outcome = await self.generate_for_companion(owner, request)
+        request_id = uuid.uuid4().hex
+        image_path = str(outcome.get("image_path") or "")
+        if image_path and os.path.isfile(image_path):
+            raw = Path(image_path).read_bytes()
+            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": request_id, "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": "image/png" if raw.startswith(b"\x89PNG") else "image/jpeg", "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": []}
+        return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "failed", "backend": "", "backend_task_id": "", "output": None, "error": {"code": "generation_failed", "stage": "execute"}, "degraded_capabilities": []}
 
     def status(self) -> dict[str, Any]:
         return self._plugin.status()
