@@ -75,6 +75,11 @@ _IMAGE_SETTING_DEFAULTS = {
 }
 
 
+def _new_reference_token() -> str:
+    """Return the 48-hex token required by the companion image contract."""
+    return uuid.uuid4().hex + uuid.uuid4().hex[:16]
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         value = value.strip().lower()
@@ -155,7 +160,7 @@ class ImageCompanionExtensionAPI:
             return {**base, "status": "failed", "lease_id": None, "asset_ids": [], "error": {"code": "reference_import_invalid"}}
         root = Path(self._plugin.data_dir) / "reference_imports"
         root.mkdir(parents=True, exist_ok=True)
-        lease_id = "reflease_" + uuid.uuid4().hex[:48]
+        lease_id = "reflease_" + _new_reference_token()
         asset_ids: list[str] = []
         paths: list[str] = []
         try:
@@ -163,7 +168,7 @@ class ImageCompanionExtensionAPI:
                 content = item.get("content") if isinstance(item, dict) else None
                 if not isinstance(content, (bytes, bytearray)) or not content:
                     raise ValueError("invalid reference")
-                asset_id = "ref_" + uuid.uuid4().hex[:48]
+                asset_id = "ref_" + _new_reference_token()
                 path = root / f"{asset_id}.bin"
                 path.write_bytes(bytes(content))
                 asset_ids.append(asset_id)
