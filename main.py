@@ -24,7 +24,7 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.3"
+PLUGIN_VERSION = "0.3.4"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
@@ -191,7 +191,7 @@ class ImageCompanionExtensionAPI:
             if set(asset_ids).issubset(set(lease.get("asset_ids", []))):
                 request["reference_image_paths"] = [path for asset_id, path in zip(lease.get("asset_ids", []), lease.get("paths", [])) if asset_id in asset_ids]
                 break
-        owner = request.pop("_owner", None)
+        owner = getattr(self, "_companion_owner", None)
         outcome = await self.generate_for_companion(owner, request)
         request_id = uuid.uuid4().hex
         image_path = str(outcome.get("image_path") or "")

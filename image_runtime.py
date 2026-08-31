@@ -23217,7 +23217,34 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         return state
 
     async def generate(self, request: dict[str, Any]) -> tuple[str, str, str]:
-        result = await self._generate_photo_image_legacy(**dict(request or {}))
+        payload = dict(request or {})
+        # ImageTask v1 carries routing and ownership metadata that the legacy
+        # executor never declared. Filter against the live method signature so
+        # old installations remain callable without weakening the new task
+        # contract or maintaining a brittle deny-list.
+        try:
+            signature = inspect.signature(self._generate_photo_image_legacy)
+            parameters = signature.parameters
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_var_kwargs:
+                payload = {
+                    name: value
+                    for name, value in payload.items()
+                    if name in parameters
+                    and parameters[name].kind
+                    in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                }
+        except (TypeError, ValueError):
+            # Keep the historical call behavior if a dynamic test double or
+            # extension cannot expose a Python signature.
+            pass
+        result = await self._generate_photo_image_legacy(**payload)
         if not isinstance(result, tuple) or len(result) != 3:
             return result
         backend, image_path, note = result
