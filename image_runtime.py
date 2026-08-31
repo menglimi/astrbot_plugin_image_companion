@@ -14115,11 +14115,14 @@ Output:
                 if canonical_mode
                 else "_set_photo_reference_library_config"
             )
-            if canonical_mode and self._photo_reference_catalog_from_image_service:
-                setter = getattr(
-                    object.__getattribute__(self, "_image_service"),
-                    setter_name,
-                    None,
+            if canonical_mode:
+                # A catalog read from the requesting owner is a migration
+                # snapshot. Only the Image service that supplied the catalog
+                # may persist resolved paths.
+                setter = (
+                    getattr(object.__getattribute__(self, "_image_service"), setter_name, None)
+                    if self._photo_reference_catalog_from_image_service
+                    else None
                 )
             else:
                 setter = getattr(self, setter_name, None)
@@ -22969,9 +22972,13 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         legacy_data_dir = str(getattr(owner, "data_dir", "") or "")
         service_data_dir = str(getattr(service, "data_dir", "") or "")
         self.data_dir = (
-            legacy_data_dir
-            if bool(getattr(service, "reuse_private_companion_assets", True)) and legacy_data_dir
-            else service_data_dir or legacy_data_dir
+            service_data_dir
+            if catalog_from_service and service_data_dir
+            else (
+                legacy_data_dir
+                if bool(getattr(service, "reuse_private_companion_assets", True)) and legacy_data_dir
+                else service_data_dir or legacy_data_dir
+            )
         )
         self._photo_reference_config_data_dir = (
             service_data_dir
@@ -23210,7 +23217,24 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         return state
 
     async def generate(self, request: dict[str, Any]) -> tuple[str, str, str]:
-        return await self._generate_photo_image_legacy(**dict(request or {}))
+        result = await self._generate_photo_image_legacy(**dict(request or {}))
+        if not isinstance(result, tuple) or len(result) != 3:
+            return result
+        backend, image_path, note = result
+        materializer = getattr(self._image_service, "materialize_legacy_output", None)
+        if image_path and callable(materializer):
+            try:
+                materialized = materializer(image_path)
+                if hasattr(materialized, "__await__"):
+                    materialized = await materialized
+                if materialized:
+                    image_path = str(materialized)
+            except Exception as exc:
+                logger.info(
+                    "[ImageCompanion] 输出物料化失败，保留原路径: error_type=%s",
+                    type(exc).__name__,
+                )
+        return backend, image_path, note
 
 
 _IMAGE_SETTING_UNSET = object()
