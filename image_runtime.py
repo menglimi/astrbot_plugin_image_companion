@@ -38,6 +38,17 @@ from xml.etree import ElementTree as ET
 
 _PHOTO_GENERATION_TRACE_FILE_LOCK = threading.Lock()
 
+
+def _photo_prompt_section_field(
+    section: Any,
+    field: str,
+    default: Any = "",
+) -> Any:
+    """Read prompt section fields across current dataclass and legacy mapping shapes."""
+    if isinstance(section, Mapping):
+        return section.get(field, default)
+    return getattr(section, field, default)
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 try:
@@ -12358,7 +12369,9 @@ Output:
         if structured_reference_plan:
             reference_fallback = ReferenceFallback((), (), (), "")
         def section_log_key(section: PhotoPromptSection, used: dict[str, int]) -> str:
-            base = _single_line(section.name, 80) or section.source
+            base = _single_line(_photo_prompt_section_field(section, "name"), 80) or _photo_prompt_section_field(
+                section, "source"
+            )
             used[base] = used.get(base, 0) + 1
             return base if used[base] == 1 else f"{base}#{used[base]}"
 
@@ -12367,16 +12380,22 @@ Output:
         after_names: dict[str, int] = {}
         for section in resolved_context.prompt_sections:
             key = section_log_key(section, after_names)
-            if section.positive or section.negative:
+            positive = _photo_prompt_section_field(section, "positive")
+            negative = _photo_prompt_section_field(section, "negative")
+            if positive or negative:
                 prompt_sections_for_log[key] = "\n".join(
-                    part for part in (section.positive, section.negative) if str(part or "").strip()
+                    str(part)
+                    for part in (positive, negative)
+                    if str(part or "").strip()
                 )
             prompt_sections_after[key] = {
-                "source": section.source,
-                "positive": section.positive,
-                "negative": section.negative,
-                "protected": section.protected,
-                "sanitize_conflicts": section.sanitize_conflicts,
+                "source": _photo_prompt_section_field(section, "source"),
+                "positive": positive,
+                "negative": negative,
+                "protected": _photo_prompt_section_field(section, "protected", False),
+                "sanitize_conflicts": _photo_prompt_section_field(
+                    section, "sanitize_conflicts", None
+                ),
             }
         detected_conflict_details = [dict(item) for item in resolved_context.detected_conflicts]
         removed_conflict_details = [dict(item) for item in resolved_context.removed_conflicts]
@@ -12385,30 +12404,36 @@ Output:
             (
                 section
                 for section in resolved_context.prompt_sections
-                if section.name == "workflow_fixed_prompt"
+                if _photo_prompt_section_field(section, "name") == "workflow_fixed_prompt"
             ),
             PhotoPromptSection("workflow_fixed_prompt", "fixed_prompt"),
         )
+        workflow_fixed_after_positive = (
+            _photo_prompt_section_field(workflow_fixed_after, "positive") or ""
+        )
+        workflow_fixed_after_negative = (
+            _photo_prompt_section_field(workflow_fixed_after, "negative") or ""
+        )
         workflow_fixed_prompt_audit.update(
             {
-                "applied": bool(workflow_fixed_after.positive or workflow_fixed_after.negative),
+                "applied": bool(workflow_fixed_after_positive or workflow_fixed_after_negative),
                 "conflict_cleaned": (
-                    workflow_fixed_section.positive != workflow_fixed_after.positive
-                    or workflow_fixed_section.negative != workflow_fixed_after.negative
+                    workflow_fixed_section.positive != workflow_fixed_after_positive
+                    or workflow_fixed_section.negative != workflow_fixed_after_negative
                 ),
                 "cleaned": bool(
                     workflow_fixed_prompt_audit.get("normalization_changed")
-                    or workflow_fixed_section.positive != workflow_fixed_after.positive
-                    or workflow_fixed_section.negative != workflow_fixed_after.negative
+                    or workflow_fixed_section.positive != workflow_fixed_after_positive
+                    or workflow_fixed_section.negative != workflow_fixed_after_negative
                 ),
-                "applied_length": len(workflow_fixed_after.positive)
-                + len(workflow_fixed_after.negative),
+                "applied_length": len(workflow_fixed_after_positive)
+                + len(workflow_fixed_after_negative),
                 "applied_sha256": hashlib.sha256(
-                    f"{workflow_fixed_after.positive}\n{workflow_fixed_after.negative}".encode(
+                    f"{workflow_fixed_after_positive}\n{workflow_fixed_after_negative}".encode(
                         "utf-8", "ignore"
                     )
                 ).hexdigest()
-                if workflow_fixed_after.positive or workflow_fixed_after.negative
+                if workflow_fixed_after_positive or workflow_fixed_after_negative
                 else "",
                 "removed_rules": list(
                     dict.fromkeys(
@@ -12442,11 +12467,13 @@ Output:
         before_names: dict[str, int] = {}
         for section in context_before:
             prompt_sections_before[section_log_key(section, before_names)] = {
-                "source": section.source,
-                "positive": section.positive,
-                "negative": section.negative,
-                "protected": section.protected,
-                "sanitize_conflicts": section.sanitize_conflicts,
+                "source": _photo_prompt_section_field(section, "source"),
+                "positive": _photo_prompt_section_field(section, "positive"),
+                "negative": _photo_prompt_section_field(section, "negative"),
+                "protected": _photo_prompt_section_field(section, "protected", False),
+                "sanitize_conflicts": _photo_prompt_section_field(
+                    section, "sanitize_conflicts", None
+                ),
             }
         prompt_path, prompt_hash = self._write_photo_prompt_debug_file(
             trace_id=trace_id,
