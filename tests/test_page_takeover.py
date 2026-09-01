@@ -5,7 +5,13 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-from astrbot_plugin_image_companion.main import ImageCompanionPlugin
+from astrbot_plugin_image_companion.main import (
+    API_VERSION,
+    PLUGIN_NAME,
+    PLUGIN_VERSION,
+    STATUS_SCHEMA_VERSION,
+    ImageCompanionPlugin,
+)
 
 
 def _plugin() -> ImageCompanionPlugin:
@@ -25,6 +31,10 @@ def test_status_exposes_runtime_takeover() -> None:
     assert plugin.status()["managed_by_private_companion"] is True
     assert plugin.status()["available"] is True
     assert plugin.status()["state"] == "managed"
+    assert plugin.status()["plugin_id"] == PLUGIN_NAME
+    assert plugin.status()["plugin_version"] == PLUGIN_VERSION
+    assert plugin.status()["status_schema_version"] == STATUS_SCHEMA_VERSION
+    assert plugin.status()["api_version"] == API_VERSION
 
 
 def test_initialize_does_not_register_independent_page_api() -> None:
