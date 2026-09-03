@@ -63,6 +63,51 @@ def test_external_availability_filters_incomplete_endpoints() -> None:
     assert runtime._external_photo_available() is False
 
 
+def test_external_availability_falls_back_when_readiness_probe_raises() -> None:
+    runtime = _runtime()
+
+    def queue(**kwargs):
+        if not kwargs:
+            raise RuntimeError("readiness probe unavailable")
+        return [
+            {
+                "name": "configured endpoint",
+                "enabled": True,
+                "base_url": "https://images.example/v1",
+                "api_key": "secret",
+                "model": "gpt-image-1",
+            }
+        ]
+
+    runtime._external_image_api_endpoint_queue = queue
+
+    assert runtime._external_photo_available() is True
+
+
+def test_backend_summary_uses_existing_backup_availability_method() -> None:
+    runtime = _runtime()
+    runtime.external_image_api_endpoints = [{"name": "configured endpoint"}]
+    runtime.photo_generation_backend = "auto"
+    runtime._external_image_api_endpoint_queue = lambda **_kwargs: [
+        {
+            "name": "configured endpoint",
+            "enabled": True,
+            "base_url": "https://images.example/v1",
+            "api_key": "secret",
+            "model": "gpt-image-1",
+        }
+    ]
+    runtime._comfyui_photo_available = lambda: False
+    runtime._sdgen_photo_available = lambda: False
+    runtime._custom_photo_tool_available = lambda: False
+    runtime._backup_external_unavailable_note = lambda: "disabled"
+
+    summary = runtime._photo_generation_backend_config_summary()
+
+    assert "external_queue=1" in summary
+    assert "backup_note=disabled" in summary
+
+
 def test_backup_external_availability_uses_runtime_configuration() -> None:
     runtime = _runtime()
     runtime._backup_external_unavailable_note = lambda: ""

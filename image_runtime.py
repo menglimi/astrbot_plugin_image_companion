@@ -9648,7 +9648,7 @@ Output:
                 f"external={self._external_photo_available()} "
                 f"external_queue={len(endpoints)} "
                 f"external_queue_items={';'.join(endpoint_bits) or '-'} "
-                f"backup_note={_single_line(self._backup_external_photo_unavailable_note(), 80) or '-'} "
+                f"backup_note={_single_line(self._backup_external_unavailable_note(), 80) or '-'} "
                 f"tool_call={self._custom_tool_photo_available()} "
                 f"tool_name={_single_line(getattr(self, 'custom_photo_tool_name', ''), 80) or '-'}"
             )
@@ -9671,7 +9671,7 @@ Output:
             f"backup_platform={_single_line(getattr(self, 'backup_external_image_api_platform', ''), 30) or '-'} "
             f"backup_model={_single_line(getattr(self, 'backup_external_image_api_model', ''), 80) or '-'} "
             f"backup_base={backup_base or '-'} "
-            f"backup_note={_single_line(self._backup_external_photo_unavailable_note(), 80) or '-'} "
+            f"backup_note={_single_line(self._backup_external_unavailable_note(), 80) or '-'} "
             f"tool_call={self._custom_tool_photo_available()} "
             f"tool_name={_single_line(getattr(self, 'custom_photo_tool_name', ''), 80) or '-'}"
         )
@@ -23151,9 +23151,37 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
     def _external_photo_available(self) -> bool:
         """Check this runtime's endpoint queue without re-entering its owner."""
         try:
-            return bool(self._external_image_api_endpoint_queue())
-        except Exception:
+            if self._external_image_api_endpoint_queue():
+                return True
+        except Exception as exc:
+            # Availability is a routing hint, not a reason to discard a
+            # configured endpoint.  A diagnostic-only failure here used to
+            # make the generation chain skip every online API silently.
+            logger.warning(
+                "[ImageCompanion] 在线图片 API 可用性检查异常，将按端点配置继续: error_type=%s",
+                type(exc).__name__,
+            )
+
+        # Re-read the unfiltered queue as a conservative fallback.  If the
+        # readiness probe itself is unavailable, a complete endpoint should
+        # still be attempted so the request layer can report its real error
+        # (authentication, model support, network, etc.).
+        try:
+            candidates = self._external_image_api_endpoint_queue(
+                include_incomplete=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ImageCompanion] 在线图片 API 端点队列读取失败: error_type=%s",
+                type(exc).__name__,
+            )
             return False
+        for endpoint in candidates:
+            if not isinstance(endpoint, dict) or not endpoint.get("enabled", True):
+                continue
+            if all(str(endpoint.get(key) or "").strip() for key in ("base_url", "api_key", "model")):
+                return True
+        return False
 
     def _backup_external_photo_available(self) -> bool:
         return not bool(self._backup_external_unavailable_note())
