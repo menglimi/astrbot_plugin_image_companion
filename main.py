@@ -24,7 +24,7 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.5"
+PLUGIN_VERSION = "0.3.6"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"
