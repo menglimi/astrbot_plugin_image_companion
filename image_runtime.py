@@ -38,6 +38,17 @@ from xml.etree import ElementTree as ET
 
 _PHOTO_GENERATION_TRACE_FILE_LOCK = threading.Lock()
 
+
+def _photo_prompt_section_field(
+    section: Any,
+    field: str,
+    default: Any = "",
+) -> Any:
+    """Read prompt section fields across current dataclass and legacy mapping shapes."""
+    if isinstance(section, Mapping):
+        return section.get(field, default)
+    return getattr(section, field, default)
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 try:
@@ -9637,7 +9648,7 @@ Output:
                 f"external={self._external_photo_available()} "
                 f"external_queue={len(endpoints)} "
                 f"external_queue_items={';'.join(endpoint_bits) or '-'} "
-                f"backup_note={_single_line(self._backup_external_photo_unavailable_note(), 80) or '-'} "
+                f"backup_note={_single_line(self._backup_external_unavailable_note(), 80) or '-'} "
                 f"tool_call={self._custom_tool_photo_available()} "
                 f"tool_name={_single_line(getattr(self, 'custom_photo_tool_name', ''), 80) or '-'}"
             )
@@ -9660,7 +9671,7 @@ Output:
             f"backup_platform={_single_line(getattr(self, 'backup_external_image_api_platform', ''), 30) or '-'} "
             f"backup_model={_single_line(getattr(self, 'backup_external_image_api_model', ''), 80) or '-'} "
             f"backup_base={backup_base or '-'} "
-            f"backup_note={_single_line(self._backup_external_photo_unavailable_note(), 80) or '-'} "
+            f"backup_note={_single_line(self._backup_external_unavailable_note(), 80) or '-'} "
             f"tool_call={self._custom_tool_photo_available()} "
             f"tool_name={_single_line(getattr(self, 'custom_photo_tool_name', ''), 80) or '-'}"
         )
@@ -12358,7 +12369,9 @@ Output:
         if structured_reference_plan:
             reference_fallback = ReferenceFallback((), (), (), "")
         def section_log_key(section: PhotoPromptSection, used: dict[str, int]) -> str:
-            base = _single_line(section.name, 80) or section.source
+            base = _single_line(_photo_prompt_section_field(section, "name"), 80) or _photo_prompt_section_field(
+                section, "source"
+            )
             used[base] = used.get(base, 0) + 1
             return base if used[base] == 1 else f"{base}#{used[base]}"
 
@@ -12367,16 +12380,22 @@ Output:
         after_names: dict[str, int] = {}
         for section in resolved_context.prompt_sections:
             key = section_log_key(section, after_names)
-            if section.positive or section.negative:
+            positive = _photo_prompt_section_field(section, "positive")
+            negative = _photo_prompt_section_field(section, "negative")
+            if positive or negative:
                 prompt_sections_for_log[key] = "\n".join(
-                    part for part in (section.positive, section.negative) if str(part or "").strip()
+                    str(part)
+                    for part in (positive, negative)
+                    if str(part or "").strip()
                 )
             prompt_sections_after[key] = {
-                "source": section.source,
-                "positive": section.positive,
-                "negative": section.negative,
-                "protected": section.protected,
-                "sanitize_conflicts": section.sanitize_conflicts,
+                "source": _photo_prompt_section_field(section, "source"),
+                "positive": positive,
+                "negative": negative,
+                "protected": _photo_prompt_section_field(section, "protected", False),
+                "sanitize_conflicts": _photo_prompt_section_field(
+                    section, "sanitize_conflicts", None
+                ),
             }
         detected_conflict_details = [dict(item) for item in resolved_context.detected_conflicts]
         removed_conflict_details = [dict(item) for item in resolved_context.removed_conflicts]
@@ -12385,30 +12404,36 @@ Output:
             (
                 section
                 for section in resolved_context.prompt_sections
-                if section.name == "workflow_fixed_prompt"
+                if _photo_prompt_section_field(section, "name") == "workflow_fixed_prompt"
             ),
             PhotoPromptSection("workflow_fixed_prompt", "fixed_prompt"),
         )
+        workflow_fixed_after_positive = (
+            _photo_prompt_section_field(workflow_fixed_after, "positive") or ""
+        )
+        workflow_fixed_after_negative = (
+            _photo_prompt_section_field(workflow_fixed_after, "negative") or ""
+        )
         workflow_fixed_prompt_audit.update(
             {
-                "applied": bool(workflow_fixed_after.positive or workflow_fixed_after.negative),
+                "applied": bool(workflow_fixed_after_positive or workflow_fixed_after_negative),
                 "conflict_cleaned": (
-                    workflow_fixed_section.positive != workflow_fixed_after.positive
-                    or workflow_fixed_section.negative != workflow_fixed_after.negative
+                    workflow_fixed_section.positive != workflow_fixed_after_positive
+                    or workflow_fixed_section.negative != workflow_fixed_after_negative
                 ),
                 "cleaned": bool(
                     workflow_fixed_prompt_audit.get("normalization_changed")
-                    or workflow_fixed_section.positive != workflow_fixed_after.positive
-                    or workflow_fixed_section.negative != workflow_fixed_after.negative
+                    or workflow_fixed_section.positive != workflow_fixed_after_positive
+                    or workflow_fixed_section.negative != workflow_fixed_after_negative
                 ),
-                "applied_length": len(workflow_fixed_after.positive)
-                + len(workflow_fixed_after.negative),
+                "applied_length": len(workflow_fixed_after_positive)
+                + len(workflow_fixed_after_negative),
                 "applied_sha256": hashlib.sha256(
-                    f"{workflow_fixed_after.positive}\n{workflow_fixed_after.negative}".encode(
+                    f"{workflow_fixed_after_positive}\n{workflow_fixed_after_negative}".encode(
                         "utf-8", "ignore"
                     )
                 ).hexdigest()
-                if workflow_fixed_after.positive or workflow_fixed_after.negative
+                if workflow_fixed_after_positive or workflow_fixed_after_negative
                 else "",
                 "removed_rules": list(
                     dict.fromkeys(
@@ -12442,11 +12467,13 @@ Output:
         before_names: dict[str, int] = {}
         for section in context_before:
             prompt_sections_before[section_log_key(section, before_names)] = {
-                "source": section.source,
-                "positive": section.positive,
-                "negative": section.negative,
-                "protected": section.protected,
-                "sanitize_conflicts": section.sanitize_conflicts,
+                "source": _photo_prompt_section_field(section, "source"),
+                "positive": _photo_prompt_section_field(section, "positive"),
+                "negative": _photo_prompt_section_field(section, "negative"),
+                "protected": _photo_prompt_section_field(section, "protected", False),
+                "sanitize_conflicts": _photo_prompt_section_field(
+                    section, "sanitize_conflicts", None
+                ),
             }
         prompt_path, prompt_hash = self._write_photo_prompt_debug_file(
             trace_id=trace_id,
@@ -12546,21 +12573,35 @@ Output:
         )
         preferred = self.photo_generation_backend
         unified_result = None
-        if not missing_identity_reference:
-            unified_result = await self._run_unified_generation_engine(
-                workflow_kind=workflow_kind,
-                request_id=trace_id,
-                request_text=current_user_request or original_prompt_text,
-                legacy_prompt=local_backend_prompt_text,
-                scene_context=scene_context_after or scene_context_before,
-                wardrobe=wardrobe,
-                ambient_policy=ambient_wardrobe_policy,
-                reference_entries=submitted_reference_entries,
-                session_key=session_key,
-                managed_reference_gate=structured_reference_gate,
-                managed_reference_plan=structured_reference_plan,
-                structured_outfit=structured_outfit,
+        if missing_identity_reference:
+            logger.info(
+                "[PrivateCompanion] 未找到身份参考图，按提示词人物描述继续生成: trace=%s kind=%s",
+                trace_id,
+                _single_line(workflow_kind, 40),
             )
+            self._append_photo_generation_trace_event(
+                trace_id,
+                "identity_reference_fallback",
+                status="degraded",
+                data={
+                    "reason": "identity_reference_unavailable",
+                    "fallback": "prompt_only_generation",
+                },
+            )
+        unified_result = await self._run_unified_generation_engine(
+            workflow_kind=workflow_kind,
+            request_id=trace_id,
+            request_text=current_user_request or original_prompt_text,
+            legacy_prompt=local_backend_prompt_text,
+            scene_context=scene_context_after or scene_context_before,
+            wardrobe=wardrobe,
+            ambient_policy=ambient_wardrobe_policy,
+            reference_entries=submitted_reference_entries,
+            session_key=session_key,
+            managed_reference_gate=structured_reference_gate,
+            managed_reference_plan=structured_reference_plan,
+            structured_outfit=structured_outfit,
+        )
         if unified_result is not None:
             self._append_photo_generation_trace_event(
                 trace_id,
@@ -12838,13 +12879,6 @@ Output:
                 "上下文清理",
                 "",
                 "生图上下文仍存在未能安全清理的服装冲突，已停止调用后端",
-            )
-
-        if missing_identity_reference:
-            return finish(
-                "参考图",
-                "",
-                "本次人物画面需要可用的身份参考图，当前未找到，已停止无参考图生成人物。",
             )
 
         if unified_result is not None:
@@ -14117,9 +14151,8 @@ Output:
             )
             if canonical_mode:
                 # A catalog read from the requesting owner is a migration
-                # snapshot. Never write resolved remote paths back through
-                # ``__getattr__`` into the old owner configuration; only the
-                # Image service that supplied the catalog may persist it.
+                # snapshot. Only the Image service that supplied the catalog
+                # may persist resolved paths.
                 setter = (
                     getattr(object.__getattribute__(self, "_image_service"), setter_name, None)
                     if self._photo_reference_catalog_from_image_service
@@ -23115,6 +23148,57 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
             pass
         return None
 
+    def _external_photo_available(self) -> bool:
+        """Check this runtime's endpoint queue without re-entering its owner."""
+        try:
+            if self._external_image_api_endpoint_queue():
+                return True
+        except Exception as exc:
+            # Availability is a routing hint, not a reason to discard a
+            # configured endpoint.  A diagnostic-only failure here used to
+            # make the generation chain skip every online API silently.
+            logger.warning(
+                "[ImageCompanion] 在线图片 API 可用性检查异常，将按端点配置继续: error_type=%s",
+                type(exc).__name__,
+            )
+
+        # Re-read the unfiltered queue as a conservative fallback.  If the
+        # readiness probe itself is unavailable, a complete endpoint should
+        # still be attempted so the request layer can report its real error
+        # (authentication, model support, network, etc.).
+        try:
+            candidates = self._external_image_api_endpoint_queue(
+                include_incomplete=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ImageCompanion] 在线图片 API 端点队列读取失败: error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        for endpoint in candidates:
+            if not isinstance(endpoint, dict) or not endpoint.get("enabled", True):
+                continue
+            if all(str(endpoint.get(key) or "").strip() for key in ("base_url", "api_key", "model")):
+                return True
+        return False
+
+    def _backup_external_photo_available(self) -> bool:
+        return not bool(self._backup_external_unavailable_note())
+
+    def _comfyui_photo_available(self) -> bool:
+        workflows_configured = bool(
+            getattr(self, "comfyui_text2img_workflow_name", "")
+            or getattr(self, "comfyui_selfie_workflow_name", "")
+        )
+        return workflows_configured and self._get_comfyui_module() is not None
+
+    def _sdgen_photo_available(self) -> bool:
+        return self._find_sdgen_plugin() is not None
+
+    def _custom_tool_photo_available(self) -> bool:
+        return self._find_custom_photo_tool_handler() is not None
+
     def _backup_external_unavailable_note(self) -> str:
         endpoints = getattr(self, "external_image_api_endpoints", [])
         if isinstance(endpoints, list) and endpoints:
@@ -23145,23 +23229,18 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
 
     def capability_status(self) -> dict[str, Any]:
         selected = _single_line(getattr(self, "photo_generation_backend", "auto"), 30) or "auto"
-        comfyui = bool(
-            (getattr(self, "comfyui_text2img_workflow_name", "") or getattr(self, "comfyui_selfie_workflow_name", ""))
-            and self._get_comfyui_module() is not None
-        )
-        sdgen = self._find_sdgen_plugin() is not None
-        try:
-            external = bool(self._external_image_api_endpoint_queue())
-        except Exception:
-            external = False
+        comfyui = self._comfyui_photo_available()
+        sdgen = self._sdgen_photo_available()
+        external = self._external_photo_available()
         backup_note = self._backup_external_unavailable_note()
-        external = external or not bool(backup_note)
-        tool_call = self._find_custom_photo_tool_handler() is not None
+        backup_external = self._backup_external_photo_available()
+        external = external or backup_external
+        tool_call = self._custom_tool_photo_available()
         backends = {
             "comfyui": comfyui,
             "sdgen": sdgen,
             "external": external,
-            "backup_external": not bool(backup_note),
+            "backup_external": backup_external,
             "tool_call": tool_call,
         }
         available = (
@@ -23218,7 +23297,34 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         return state
 
     async def generate(self, request: dict[str, Any]) -> tuple[str, str, str]:
-        result = await self._generate_photo_image_legacy(**dict(request or {}))
+        payload = dict(request or {})
+        # ImageTask v1 carries routing and ownership metadata that the legacy
+        # executor never declared. Filter against the live method signature so
+        # old installations remain callable without weakening the new task
+        # contract or maintaining a brittle deny-list.
+        try:
+            signature = inspect.signature(self._generate_photo_image_legacy)
+            parameters = signature.parameters
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_var_kwargs:
+                payload = {
+                    name: value
+                    for name, value in payload.items()
+                    if name in parameters
+                    and parameters[name].kind
+                    in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                }
+        except (TypeError, ValueError):
+            # Keep the historical call behavior if a dynamic test double or
+            # extension cannot expose a Python signature.
+            pass
+        result = await self._generate_photo_image_legacy(**payload)
         if not isinstance(result, tuple) or len(result) != 3:
             return result
         backend, image_path, note = result

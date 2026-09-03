@@ -104,6 +104,26 @@ class LegacyTraceRecorderBridgeTests(unittest.TestCase):
                 ["request_received", "completed"],
             )
 
+    def test_prompt_section_field_accepts_legacy_mapping(self):
+        section = {
+            "name": "legacy_request",
+            "source": "user_request",
+            "positive": "a portrait",
+            "negative": "blurry",
+        }
+
+        self.assertEqual(
+            RUNTIME._photo_prompt_section_field(section, "source"),
+            "user_request",
+        )
+        self.assertEqual(
+            RUNTIME._photo_prompt_section_field(section, "positive"),
+            "a portrait",
+        )
+        self.assertFalse(
+            RUNTIME._photo_prompt_section_field(section, "protected", False)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

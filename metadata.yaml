@@ -2,7 +2,7 @@ name: astrbot_plugin_image_companion
 display_name: 我会画给你看
 author: menglimi
 author_url: https://github.com/menglimi
-version: 0.3.1
+version: 0.3.5
 description: “我会永远陪着你”的图像生成扩展，支持文生图、自拍、人像改图、参考图库及多种生图后端。
 desc: 陪伴插件的生图、改图、参考图库与多后端扩展。
 repo: https://github.com/menglimi/astrbot_plugin_image_companion

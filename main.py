@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
+import os
 import sys
+import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,7 +24,10 @@ from .photo_reference_catalog import CATALOG_VERSION, load_catalog, validate_and
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.5"
+PLUGIN_DISPLAY_NAME = "我会画给你看"
+STATUS_SCHEMA_VERSION = "image.status.v1"
+API_VERSION = "image.generation-api.v1"
 _active_plugin: "ImageCompanionPlugin | None" = None
 
 _IMAGE_SETTING_DEFAULTS = {
@@ -71,6 +78,11 @@ _IMAGE_SETTING_DEFAULTS = {
 }
 
 
+def _new_reference_token() -> str:
+    """Return the 48-hex token required by the companion image contract."""
+    return uuid.uuid4().hex + uuid.uuid4().hex[:16]
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         value = value.strip().lower()
@@ -96,6 +108,143 @@ class ImageCompanionExtensionAPI:
 
     def __init__(self, plugin: "ImageCompanionPlugin") -> None:
         self._plugin = plugin
+        self._instance_generation = int(time.time_ns() % 2_000_000_000) or 1
+        self._reference_leases: dict[str, dict[str, Any]] = {}
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "plugin_id": PLUGIN_NAME,
+            "instance_generation": self._instance_generation,
+            "api_family": "image.generation",
+            "api_version": API_VERSION,
+            "supported_task_versions": ["image.task.v1"],
+            "capabilities": [
+                "image.build-task", "image.validate-task", "image.import-references",
+                "image.release-reference-import", "image.execute-task", "image.execute-task.active",
+            ],
+            "lifecycle_state": "ready",
+            "degraded_reasons": [],
+        }
+
+    def versions(self) -> dict[str, Any]:
+        return {
+            "plugin_id": PLUGIN_NAME,
+            "instance_generation": self._instance_generation,
+            "api_family": "image.generation",
+            "api_version": API_VERSION,
+            "task_version": "image.task.v1",
+            "supported_task_versions": ["image.task.v1"],
+        }
+
+    def build_task(self, payload: dict[str, Any]) -> dict[str, Any]:
+        value = dict(payload or {})
+        return {
+            "version": "image.task.v1",
+            "operation": "generate",
+            "workflow_kind": str(value.get("workflow_kind") or "text2img"),
+            "input": value,
+            "instance_generation": self._instance_generation,
+        }
+
+    def validate_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        valid = (
+            isinstance(task, dict) and task.get("version") == "image.task.v1"
+            and task.get("operation") == "generate"
+            and isinstance(task.get("workflow_kind"), str)
+            and isinstance(task.get("input"), dict)
+            and task.get("instance_generation") == self._instance_generation
+        )
+        return {"valid": valid, "task_version": "image.task.v1", "operation": "generate", "workflow_kind": str(task.get("workflow_kind") or "") if isinstance(task, dict) else ""}
+
+    @staticmethod
+    def _image_content_type(content: bytes | bytearray) -> tuple[str, str]:
+        raw = bytes(content)
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png", "image/png"
+        if raw.startswith(b"\xff\xd8\xff"):
+            return ".jpg", "image/jpeg"
+        if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+            return ".webp", "image/webp"
+        return "", ""
+
+    async def import_references(self, payload: dict[str, Any]) -> dict[str, Any]:
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        base = {"result_version": "image.reference-import-result.v1", "instance_generation": self._instance_generation, "ttl_seconds": 90}
+        if not isinstance(assets, list) or not assets or len(assets) > 4:
+            return {**base, "status": "failed", "lease_id": None, "asset_ids": [], "error": {"code": "reference_import_invalid"}}
+        root = Path(self._plugin.data_dir) / "reference_imports"
+        root.mkdir(parents=True, exist_ok=True)
+        lease_id = "reflease_" + _new_reference_token()
+        asset_ids: list[str] = []
+        paths: list[str] = []
+        try:
+            for item in assets:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, (bytes, bytearray)) or not content:
+                    raise ValueError("invalid reference")
+                suffix, _media_type = self._image_content_type(content)
+                if not suffix:
+                    raise ValueError("unsupported reference format")
+                asset_id = "ref_" + _new_reference_token()
+                path = root / f"{asset_id}{suffix}"
+                path.write_bytes(bytes(content))
+                asset_ids.append(asset_id)
+                paths.append(str(path))
+            self._reference_leases[lease_id] = {"asset_ids": asset_ids, "paths": paths}
+            return {**base, "status": "succeeded", "lease_id": lease_id, "asset_ids": asset_ids, "error": None}
+        except Exception:
+            for path in paths:
+                try: Path(path).unlink(missing_ok=True)
+                except OSError: pass
+            return {**base, "status": "failed", "lease_id": None, "asset_ids": [], "error": {"code": "reference_import_failed"}}
+
+    def release_reference_import(self, lease_id: str) -> bool:
+        lease = self._reference_leases.pop(str(lease_id or ""), None)
+        if not isinstance(lease, dict): return False
+        for path in lease.get("paths", []):
+            try: Path(path).unlink(missing_ok=True)
+            except OSError: pass
+        return True
+
+    @staticmethod
+    def _generation_failure_code(outcome: dict[str, Any]) -> tuple[str, str]:
+        backend = str(outcome.get("backend") or "").strip().lower()
+        note = str(outcome.get("note") or "").strip().lower()
+        text = f"{backend} {note}"
+        if any(marker in text for marker in ("参考图", "reference")):
+            return "reference_unavailable", "reference"
+        if any(marker in text for marker in ("未配置", "不可用", "disabled", "unavailable")):
+            return "backend_unavailable", "routing"
+        if any(marker in text for marker in ("超时", "timeout", "timed out")):
+            return "provider_timeout", "provider"
+        if any(marker in text for marker in ("安全", "策略", "policy", "rejected", "拒绝")):
+            return "provider_rejected", "provider"
+        if any(marker in text for marker in ("下载", "落盘", "文件", "materialization")):
+            return "result_materialization_failed", "result"
+        if any(marker in text for marker in ("路由", "route", "workflow")):
+            return "route_failed", "routing"
+        if note:
+            return "provider_failed", "provider"
+        return "generation_failed", "execute"
+
+    async def execute_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        request = dict(task.get("input") or {}) if isinstance(task, dict) else {}
+        asset_ids = request.get("reference_asset_ids") or []
+        for lease in self._reference_leases.values():
+            if set(asset_ids).issubset(set(lease.get("asset_ids", []))):
+                request["reference_image_paths"] = [path for asset_id, path in zip(lease.get("asset_ids", []), lease.get("paths", [])) if asset_id in asset_ids]
+                break
+        owner = getattr(self, "_companion_owner", None)
+        outcome = await self.generate_for_companion(owner, request)
+        request_id = uuid.uuid4().hex
+        image_path = str(outcome.get("image_path") or "")
+        if image_path and os.path.isfile(image_path):
+            raw = Path(image_path).read_bytes()
+            _suffix, media_type = self._image_content_type(raw)
+            media_type = media_type or "image/jpeg"
+            return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "succeeded", "backend": "comfyui" if str(outcome.get("backend") or "").lower() == "comfyui" else "external", "backend_task_id": request_id, "output": {"asset_id": "image_" + request_id[:32], "kind": "image", "media_type": media_type, "local_path": image_path, "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}, "error": None, "degraded_capabilities": []}
+        error_code, error_stage = self._generation_failure_code(outcome)
+        return {"result_version": "image.result.v1", "task_version": "image.task.v1", "request_id": request_id, "status": "failed", "backend": "", "backend_task_id": "", "output": None, "error": {"code": error_code, "stage": error_stage}, "degraded_capabilities": []}
 
     def status(self) -> dict[str, Any]:
         return self._plugin.status()
@@ -157,27 +306,68 @@ class ImageCompanionExtensionAPI:
         return self._comfyui_service(owner).validate_mapping(workflow_id, mapping, save=save)
 
     def capability_status(self, owner: Any) -> dict[str, Any]:
+        identity = {
+            "plugin_id": PLUGIN_NAME,
+            "plugin_name": PLUGIN_DISPLAY_NAME,
+            "plugin_version": PLUGIN_VERSION,
+            "status_schema_version": STATUS_SCHEMA_VERSION,
+            "api_version": API_VERSION,
+        }
         if not self._host_available():
             return {
+                **identity,
                 "installed": True,
                 "enabled": self._plugin.enabled,
                 "available": False,
+                "state": "unavailable",
                 "reason": "private_companion_required",
                 "selected_backend": str(self._plugin.image_setting("photo_generation_backend", "auto") or "auto"),
                 "backup_external_note": "private_companion_required",
                 "backends": {},
+                "endpoint_count": 0,
+                "ready_endpoint_count": 0,
             }
         if not self._plugin.enabled:
             return {
+                **identity,
                 "installed": True,
                 "enabled": False,
                 "available": False,
+                "state": "unavailable",
                 "reason": "disabled",
                 "selected_backend": str(self._plugin.image_setting("photo_generation_backend", "auto") or "auto"),
                 "backup_external_note": "disabled",
                 "backends": {},
+                "endpoint_count": 0,
+                "ready_endpoint_count": 0,
             }
-        return ImageGenerationRuntime(self._plugin, owner).capability_status()
+        runtime = ImageGenerationRuntime(self._plugin, owner)
+        status = dict(runtime.capability_status())
+        endpoint_queue: list[dict[str, Any]] = []
+        try:
+            endpoint_queue = [
+                endpoint
+                for endpoint in runtime._external_image_api_endpoint_queue(include_incomplete=True)
+                if isinstance(endpoint, dict) and endpoint.get("enabled", True)
+            ]
+        except Exception:
+            endpoint_queue = []
+        ready_endpoint_count = 0
+        for endpoint in endpoint_queue:
+            try:
+                if not runtime._external_image_api_endpoint_unavailable_note(endpoint):
+                    ready_endpoint_count += 1
+            except Exception:
+                continue
+        status.update(
+            {
+                **identity,
+                "state": "ready" if status.get("available") else "unavailable",
+                "endpoint_count": len(endpoint_queue),
+                "ready_endpoint_count": ready_endpoint_count,
+            }
+        )
+        return status
 
     def local_load_state(self, owner: Any, *, force_refresh: bool = False) -> dict[str, Any]:
         if not self._host_available():
@@ -513,7 +703,8 @@ class ImageCompanionPlugin(Star):
 
     def status(self) -> dict[str, Any]:
         metrics = getattr(self, "generation_metrics", None)
-        managed = self._private_companion_api() is not None
+        private_api = self._private_companion_api()
+        managed = private_api is not None
         config = getattr(self, "config", {})
         raw_debug = config.get("debug") if isinstance(config, dict) and isinstance(config.get("debug"), dict) else {}
         if not raw_debug and isinstance(config, dict) and isinstance(config.get("image"), dict):
@@ -551,7 +742,36 @@ class ImageCompanionPlugin(Star):
             "sensitive": debug_mode == "full_with_secrets" and include_secrets,
             "legacy_compatibility": legacy_trace_enabled,
         }
+        generation_status: dict[str, Any] = {
+            "plugin_id": PLUGIN_NAME,
+            "plugin_name": PLUGIN_DISPLAY_NAME,
+            "plugin_version": PLUGIN_VERSION,
+            "status_schema_version": STATUS_SCHEMA_VERSION,
+            "api_version": API_VERSION,
+            "installed": True,
+            "enabled": self.enabled,
+            "available": False,
+            "state": "unknown",
+            "reason": "capability_snapshot_unavailable",
+            "backends": {},
+            "endpoint_count": 0,
+            "ready_endpoint_count": 0,
+        }
+        owner = getattr(private_api, "_plugin", None) if private_api is not None else None
+        capability_getter = getattr(getattr(self, "extension_api", None), "capability_status", None)
+        if owner is not None and callable(capability_getter):
+            try:
+                value = capability_getter(owner)
+                if isinstance(value, dict):
+                    generation_status = dict(value)
+            except Exception:
+                pass
         return {
+            "plugin_id": PLUGIN_NAME,
+            "plugin_name": PLUGIN_DISPLAY_NAME,
+            "plugin_version": PLUGIN_VERSION,
+            "status_schema_version": STATUS_SCHEMA_VERSION,
+            "api_version": API_VERSION,
             "installed": True,
             "enabled": self.enabled,
             "available": bool(self.enabled and managed),
@@ -562,6 +782,12 @@ class ImageCompanionPlugin(Star):
             "reuse_private_companion_assets": self.reuse_private_companion_assets,
             "generation_count": self.generation_count,
             "last_generation": copy.deepcopy(self.last_generation),
+            "generation": generation_status,
+            "backends": dict(generation_status.get("backends") or {}),
+            "selected_backend": str(generation_status.get("selected_backend") or ""),
+            "backup_external_note": str(generation_status.get("backup_external_note") or ""),
+            "endpoint_count": int(generation_status.get("endpoint_count") or 0),
+            "ready_endpoint_count": int(generation_status.get("ready_endpoint_count") or 0),
             "debug": debug_status,
             "unified_engine": route_diagnostics(config if isinstance(config, dict) else {}),
             "metrics": metrics.snapshot() if callable(getattr(metrics, "snapshot", None)) else {},
