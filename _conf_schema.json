@@ -35,7 +35,8 @@
       "rewrite_enabled": {
         "description": "按工作流重写和拆分提示词",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "模型失败时使用原提示词和已确认语义槽继续生成；原始内容不足或映射无效时停止。"
       },
       "prompt_provider_id": {
         "description": "提示词处理模型",

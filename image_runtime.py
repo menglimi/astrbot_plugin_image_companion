@@ -10007,6 +10007,8 @@ Output:
         workflow_fixed_prompt_audit: dict[str, Any] | None = None,
         generation_completed: bool = False,
         failure_stage: str = "",
+        task_id: str = "",
+        degraded_capabilities: tuple[str, ...] = (),
     ) -> None:
         try:
             reference_candidate = reference_candidate or {}
@@ -10046,6 +10048,12 @@ Output:
                 "ok": bool(ok),
                 "generation_completed": bool(generation_completed),
                 "failure_stage": _single_line(failure_stage, 60),
+                "task_id": _single_line(task_id, 256),
+                "degraded_capabilities": list(dict.fromkeys(
+                    _single_line(value, 120)
+                    for value in (degraded_capabilities or ())
+                    if _single_line(value, 120)
+                ))[:12],
                 "prompt_format": (
                     self._normalize_photo_generation_prompt_format(prompt_format)
                     if prompt_format
@@ -12793,6 +12801,8 @@ Output:
             structured_reference_submitted: bool = False,
             generation_completed: bool = False,
             failure_stage: str = "",
+            task_id: str = "",
+            degraded_capabilities: tuple[str, ...] = (),
         ) -> tuple[str, str, str]:
             elapsed_ms = int((time.time() - started) * 1000)
             actual_submitted_prompt = (
@@ -12927,6 +12937,8 @@ Output:
                 workflow_fixed_prompt_audit=workflow_fixed_prompt_audit,
                 generation_completed=generation_completed,
                 failure_stage=failure_stage,
+                task_id=task_id,
+                degraded_capabilities=degraded_capabilities,
             )
             self._append_photo_generation_trace_event(
                 trace_id,
@@ -12988,13 +13000,18 @@ Output:
                     unified_result.note or "ok",
                     reference_submitted=bool(unified_result.submitted_reference_ids),
                     generation_completed=unified_result.generation_completed,
+                    task_id=unified_result.task_id,
+                    degraded_capabilities=unified_result.degraded_capabilities,
                 )
             if rollout.mode == "active" and rollout.engine_enabled:
                 return finish(
                     f"统一引擎/{unified_result.backend or 'route'}",
                     "",
                     unified_result.note or unified_result.error_code or "统一生图路线失败",
+                    generation_completed=unified_result.generation_completed,
                     failure_stage=unified_result.failure_stage,
+                    task_id=unified_result.task_id,
+                    degraded_capabilities=unified_result.degraded_capabilities,
                 )
 
         if structured_reference_plan:
@@ -16006,7 +16023,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             type(exc).__name__,
                         )
                 self._native_comfyui_last_result = outcome
-                return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"]
+                fallback_note = "；提示词重写不可用，已使用原提示词" if outcome.get("rewrite_fallback") else ""
+                return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"] + fallback_note
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

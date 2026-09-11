@@ -456,6 +456,8 @@ class PhotoPromptReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 reference_used=True,
                 reference_candidate={"id": "sleepwear", "kind": "library"},
                 prompt_path=prompt_path,
+                task_id="unified-task",
+                degraded_capabilities=("prompt_rewrite:original", "reference:missing"),
             )
 
             metadata = harness._photo_generation_result_metadata(
@@ -466,6 +468,11 @@ class PhotoPromptReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metadata["path"], output_path)
             self.assertEqual(metadata["prompt_path"], prompt_path)
             self.assertTrue(metadata["reference_used"])
+            self.assertEqual(metadata["task_id"], "unified-task")
+            self.assertEqual(
+                metadata["degraded_capabilities"],
+                ["prompt_rewrite:original", "reference:missing"],
+            )
 
     def test_daily_outfit_aliases_are_removed_from_conflicting_scene_context(self) -> None:
         for label in ("今日穿搭", "当天穿搭", "日常穿搭", "today's outfit", "daily outfit"):

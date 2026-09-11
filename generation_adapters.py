@@ -290,12 +290,15 @@ class ComfyUIServiceAdapter:
                 "reference_asset_roles": [list(r.roles) for r in references.submitted],
             }, [r.path for r in references.submitted], self.rewrite_call,
                 mapping_override=route.settings.get("mapping"), timeout_seconds=route.timeout_seconds)
-            trace.append({"stage": "native_comfyui_result", "at": time.time(), "data": {"task_id": result["task_id"], "workflow": route.key.workflow, "dimensions": result["dimensions"]}})
+            degraded = references.degraded_capabilities
+            if result.get("rewrite_fallback"):
+                degraded = tuple(dict.fromkeys((*degraded, "prompt_rewrite:original")))
+            trace.append({"stage": "native_comfyui_result", "at": time.time(), "data": {"task_id": result["task_id"], "workflow": route.key.workflow, "dimensions": result["dimensions"], "rewrite_fallback": bool(result.get("rewrite_fallback"))}})
             return GenerationResultV1(request_id=spec.request_id, task_id=result["task_id"], backend=self.backend,
                                       model_profile=prompt.model_profile, workflow=route.key.workflow,
                                       image_path=result["image_path"], generation_completed=True,
                                       submitted_reference_ids=tuple(r.reference_id for r in references.submitted),
-                                      degraded_capabilities=references.degraded_capabilities, trace=tuple(trace))
+                                      degraded_capabilities=degraded, trace=tuple(trace))
         inspection = self.service.inspect_workflow(route.key.workflow)
         inspection_slots = inspection.get("slots") if isinstance(inspection.get("slots"), list) else []
         available_slot_names = {

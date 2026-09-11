@@ -301,7 +301,7 @@ async def test_analysis_omits_long_custom_input_values(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bad_model_output_never_submits_and_execution_error_does_not_retry(tmp_path):
+async def test_bad_model_output_without_original_never_submits_and_execution_error_does_not_retry(tmp_path):
     service = ComfyUIService({"base_url": "http://test.invalid", "workflows": [{"name": "test", "workflow": graph()}]}, tmp_path)
     calls = []
     async def request(method, path, **kwargs):
@@ -312,7 +312,7 @@ async def test_bad_model_output_never_submits_and_execution_error_does_not_retry
     service._request = request
     async def bad(prompt):
         return "not JSON"
-    with pytest.raises(WorkflowError, match="JSON"):
+    with pytest.raises(WorkflowError, match="原提示词也无法降级"):
         await service.generate_image("test", {}, [], bad)
     assert calls == []
     with pytest.raises(WorkflowError, match="执行失败"):

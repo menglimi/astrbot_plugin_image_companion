@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote, urlencode, urlsplit
 
-from .comfyui_prompts import ModelCall, choose_dimensions, parse_object, rewrite_prompts
+from .comfyui_prompts import ModelCall, choose_dimensions, original_prompt_slots, parse_object, rewrite_prompts
 from .comfyui_workflows import WorkflowError, WorkflowStore, fill_workflow, fingerprint, infer_mapping, validate_mapping
 
 
@@ -267,7 +268,23 @@ class ComfyUIService:
                     fields[name] = {**fields[name], **target}
                 mapping = validate_mapping(workflow, {**mapping, "fields": fields})
         stamp = fingerprint(workflow)
-        slots, orientation = await rewrite_prompts(workflow, mapping, request, call, str(self.config.get("rewrite_instructions", "")))
+        rewrite_fallback_reason = ""
+        try:
+            slots, orientation = await rewrite_prompts(workflow, mapping, request, call, str(self.config.get("rewrite_instructions", "")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if call is None:
+                raise
+            try:
+                slots = original_prompt_slots(workflow, mapping, request)
+            except WorkflowError as fallback_error:
+                raise WorkflowError(f"提示词重写失败，原提示词也无法降级：{fallback_error}") from exc
+            orientation = ""  # Discard all unvalidated model output, including size hints.
+            rewrite_fallback_reason = type(exc.__cause__ or exc).__name__
+            logging.getLogger(__name__).warning(
+                "提示词重写失败，已降级为原提示词与现有工作流：error_type=%s", rewrite_fallback_reason,
+            )
         dimensions = choose_dimensions(self.config, {**request, "has_reference": bool(references)}, orientation)
         if dimensions:
             for name, value in zip(("width", "height"), dimensions):
@@ -341,6 +358,7 @@ class ComfyUIService:
                     except asyncio.TimeoutError:
                         break
                     return {"image_path": path, "task_id": task_id, "workflow": workflow_id, "fingerprint": stamp,
+                            "rewrite_fallback": bool(rewrite_fallback_reason), "rewrite_fallback_reason": rewrite_fallback_reason,
                             "dimensions": dimensions, "prompt_slots": {k: v for k, v in slots.items() if mapping["fields"][k]["kind"] == "prompt"}}
                 await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
             cleanup_attempted = True
