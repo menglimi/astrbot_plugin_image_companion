@@ -10,7 +10,11 @@ from typing import Any, Mapping
 
 
 class WorkflowError(ValueError):
-    pass
+    def __init__(self, message: str, *, submitted: bool = False, task_id: str = "", failure_stage: str = "preflight"):
+        super().__init__(message)
+        self.submitted = submitted
+        self.task_id = task_id
+        self.failure_stage = failure_stage
 
 
 def fingerprint(value: Mapping[str, Any]) -> str:

@@ -113,6 +113,7 @@ class ImageCompanionExtensionAPI:
         self._plugin = plugin
         self._instance_generation = int(time.time_ns() % 2_000_000_000) or 1
         self._reference_leases: dict[str, dict[str, Any]] = {}
+        self._comfyui_config_lock = asyncio.Lock()
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -320,6 +321,30 @@ class ImageCompanionExtensionAPI:
             reason = str(getattr(self._plugin, "_native_comfyui_error", "") or "").strip()
             raise WorkflowError(reason or "请先配置 ComfyUI 地址")
         return await service.test_connection()
+
+    def get_comfyui_config(self) -> dict[str, Any]:
+        from .comfyui_config import public_config
+        return public_config(self._plugin.config.get("comfyui", {}) or {})
+
+    def get_comfyui_schema(self) -> dict[str, Any]:
+        from .comfyui_config import settings_schema
+        return settings_schema()
+
+    async def update_comfyui_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        from .comfyui_config import normalize_config
+        async with self._comfyui_config_lock:
+            previous = copy.deepcopy(self._plugin.config.get("comfyui", {}) or {})
+            value = normalize_config(previous, updates)
+            if value.get("base_url"):
+                service = ComfyUIService(value, Path(self._plugin.data_dir))
+                for key in ("text2img_workflow", "selfie_workflow"):
+                    if value.get(key):
+                        service.inspect_workflow(value[key])
+            self._plugin.config["comfyui"] = value
+            if not await self._plugin._save_config_if_possible():
+                self._plugin.config["comfyui"] = previous
+                raise WorkflowError("ComfyUI 配置保存失败，已恢复原配置")
+            return self.get_comfyui_config()
 
     def import_comfyui_workflow(self, name: str, workflow: Any) -> dict[str, Any]:
         service = self._plugin.native_comfyui_service()

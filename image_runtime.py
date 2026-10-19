@@ -8763,7 +8763,6 @@ Output:
             prompt_text=prompt_text,
             request_text=prompt_text,
             session_key="daily_outfit",
-            image_size="1024x1024",
             allow_daily_outfit_reference=False,
             prompt_sections=prompt_sections,
         )
@@ -9620,8 +9619,10 @@ Output:
             unique.append(item)
         return _single_line(", ".join(unique), 620)
 
-    def _choose_photo_workflow_name(self, kind: str) -> str:
+    def _choose_photo_workflow_name(self, kind: str, *, has_reference: bool | None = None) -> str:
         normalized = str(kind or "").strip().lower()
+        if has_reference is False:
+            return self.comfyui_text2img_workflow_name
         if normalized in {"selfie", "portrait", "自拍", "人像", "edit", "改图", "修图", "重绘", "p图"}:
             return self.comfyui_selfie_workflow_name or self.comfyui_text2img_workflow_name
         return self.comfyui_text2img_workflow_name or self.comfyui_selfie_workflow_name
@@ -13028,7 +13029,7 @@ Output:
                     "",
                     f"Q5 受管参考素材未提交：电脑高负荷（{busy_state.get('reason') or '负载偏高'}）",
                 )
-            workflow_name = self._choose_photo_workflow_name(workflow_kind)
+            workflow_name = self._choose_photo_workflow_name(workflow_kind, has_reference=True)
             if not workflow_name:
                 return finish(
                     "ComfyUI",
@@ -13091,38 +13092,44 @@ Output:
                 generation_completed=result.generation_completed,
                 failure_stage=result.failure_stage,
             )
-        native_comfyui = self._native_comfyui_service()
-        # An incomplete native configuration should remain a routing hint in
-        # auto mode. Let configured online/legacy backends continue instead of
-        # turning an optional connection into a hard failure.
+        native_attempted = False
+        comfyui_note = ""
         if preferred == "comfyui" or (
             preferred == "auto"
-            and native_comfyui is not None
             and self._comfyui_photo_available()
         ):
             if not self._comfyui_photo_available():
                 return finish("ComfyUI", "", "ComfyUI 后端不可用或未配置")
+            native_attempted = True
+            self._native_comfyui_last_result = {}
             busy_state = self._local_photo_generation_busy_state(force_refresh=True)
+            workflow_name = self._choose_photo_workflow_name(workflow_kind, has_reference=bool(reference_image_paths))
+            image_path = ""
             if busy_state:
-                return finish("ComfyUI", "", f"电脑高负荷,已跳过本地生图（{busy_state.get('reason') or '负载偏高'}）")
-            workflow_name = self._choose_photo_workflow_name(workflow_kind)
-            if not workflow_name:
-                return finish("ComfyUI", "", f"未配置 {workflow_kind} 对应的 ComfyUI 工作流")
-            image_path, note = await self._run_comfyui_photo_workflow(
-                workflow_name,
-                local_backend_prompt_text,
-                negative_prompt_text=local_backend_negative_prompt_text,
-                session_key=session_key,
-                reference_image_path=reference_image_path,
-                reference_image_paths=reference_image_paths,
-                semantic_prompt_slots=semantic_prompt_slots,
-            )
-            return finish(
-                "ComfyUI",
-                image_path,
-                note,
-                reference_submitted=bool(reference_image_paths),
-            )
+                note = f"电脑高负荷,已跳过本地生图（{busy_state.get('reason') or '负载偏高'}）"
+            elif not workflow_name:
+                note = f"未配置 {workflow_kind} 对应的 ComfyUI 工作流"
+            else:
+                image_path, note = await self._run_comfyui_photo_workflow(
+                    workflow_name,
+                    local_backend_prompt_text,
+                    negative_prompt_text=local_backend_negative_prompt_text,
+                    session_key=session_key,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
+                    image_size=image_size,
+                    semantic_prompt_slots=semantic_prompt_slots,
+                )
+            native_result = getattr(self, "_native_comfyui_last_result", {}) or {}
+            if image_path or preferred == "comfyui" or native_result.get("submitted"):
+                return finish(
+                    "ComfyUI", image_path, note,
+                    reference_submitted=bool(reference_image_paths) and bool(native_result.get("submitted") or image_path),
+                    failure_stage=native_result.get("failure_stage", ""),
+                    task_id=native_result.get("task_id", ""),
+                )
+            comfyui_note = note
+            logger.info("[ImageCompanion] ComfyUI 提交前失败或跳过，继续后端回退: trace=%s note=%s", trace_id, _single_line(note, 180))
         if preferred == "sdgen":
             if not self._sdgen_photo_available():
                 return finish("SDGen", "", "SDGen 插件不可用或未配置")
@@ -13194,14 +13201,9 @@ Output:
                     generation_completed=True,
                     failure_stage="result_materialization",
                 )
-            can_fallback = self._comfyui_photo_available() or (not reference_image_path and self._sdgen_photo_available())
-            if not can_fallback:
-                return finish("在线图片 API", "", note)
-            logger.info("[PrivateCompanion] 固定在线图片 API 未成功,继续尝试可用后端回退: trace=%s note=%s", trace_id, _single_line(note, 180))
+            return finish("在线图片 API", "", note)
         external_note = ""
-        if preferred == "external":
-            external_note = note
-        elif self._external_photo_available():
+        if self._external_photo_available():
             external_outcome = self._coerce_external_photo_generation_outcome(
                 await self._run_external_photo_generation(
                     prompt_text,
@@ -13235,13 +13237,14 @@ Output:
         else:
             external_note = "在线图片 API 后端不可用或未配置"
             logger.info("[PrivateCompanion] 生图后端跳过: trace=%s backend=external note=%s", trace_id, external_note)
-        if self._comfyui_photo_available():
+        if not native_attempted and self._comfyui_photo_available():
+            self._native_comfyui_last_result = {}
             busy_state = self._local_photo_generation_busy_state(force_refresh=True)
             if busy_state:
                 comfyui_note = f"电脑高负荷,已跳过本地生图（{busy_state.get('reason') or '负载偏高'}）"
                 logger.info("[PrivateCompanion] 生图后端跳过: trace=%s backend=comfyui note=%s", trace_id, _single_line(comfyui_note, 180))
             else:
-                workflow_name = self._choose_photo_workflow_name(workflow_kind)
+                workflow_name = self._choose_photo_workflow_name(workflow_kind, has_reference=bool(reference_image_paths))
                 if workflow_name:
                     image_path, note = await self._run_comfyui_photo_workflow(
                         workflow_name,
@@ -13250,6 +13253,7 @@ Output:
                         session_key=session_key,
                         reference_image_path=reference_image_path,
                         reference_image_paths=reference_image_paths,
+                        image_size=image_size,
                         semantic_prompt_slots=semantic_prompt_slots,
                     )
                     if image_path:
@@ -13259,12 +13263,15 @@ Output:
                             note,
                             reference_submitted=bool(reference_image_paths),
                         )
+                    native_result = getattr(self, "_native_comfyui_last_result", {}) or {}
+                    if native_result.get("submitted"):
+                        return finish("ComfyUI", "", note, failure_stage=native_result.get("failure_stage", "result"), task_id=native_result.get("task_id", ""))
                     comfyui_note = note
                     logger.info("[PrivateCompanion] 生图后端回退: trace=%s backend=comfyui note=%s", trace_id, _single_line(note, 180))
                 else:
                     comfyui_note = f"未配置 {workflow_kind} 对应的 ComfyUI 工作流"
                     logger.info("[PrivateCompanion] 生图后端跳过: trace=%s backend=comfyui note=%s", trace_id, _single_line(comfyui_note, 180))
-        else:
+        elif not native_attempted:
             comfyui_note = "ComfyUI 后端不可用或未配置"
             logger.info("[PrivateCompanion] 生图后端跳过: trace=%s backend=comfyui note=%s", trace_id, comfyui_note)
         if reference_image_path:
@@ -15459,6 +15466,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         requested = max(1, _safe_int(requested_images, 1, 1))
         native = self._native_comfyui_service()
         if native is not None:
+            self._native_comfyui_last_result = {}
             inspection = native.inspect_workflow(self._choose_photo_workflow_name(workflow_kind))
             return min(requested, sum(item.get("kind") == "image" and item.get("mode") != "preserve" for item in inspection["slots"]))
         module = self._get_comfyui_module()
@@ -15524,12 +15532,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         if preferred == "tool_call":
             return 1
 
-        availability = (
+        availability = [
             ("_external_photo_available", 1),
             ("_comfyui_photo_available", None),
             ("_custom_tool_photo_available", 1),
             ("_sdgen_photo_available", 0),
-        )
+        ]
+        if preferred == "auto":
+            availability[0], availability[1] = availability[1], availability[0]
         for method_name, capacity in availability:
             checker = getattr(self, method_name, None)
             if not callable(checker):
@@ -16022,13 +16032,18 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             "[ImageCompanion] ComfyUI 结果归档失败，保留直连路径: error_type=%s",
                             type(exc).__name__,
                         )
-                self._native_comfyui_last_result = outcome
+                self._native_comfyui_last_result = {**outcome, "submitted": True}
                 fallback_note = "；提示词重写不可用，已使用原提示词" if outcome.get("rewrite_fallback") else ""
                 return outcome["image_path"], "ok；ComfyUI 任务 " + outcome["task_id"] + fallback_note
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 from .comfyui_workflows import WorkflowError
+                self._native_comfyui_last_result = {
+                    "submitted": bool(getattr(exc, "submitted", False)),
+                    "task_id": getattr(exc, "task_id", ""),
+                    "failure_stage": getattr(exc, "failure_stage", "preflight"),
+                }
                 logger.warning("[ImageCompanion] ComfyUI 直连失败: %s", _single_line(exc, 300) if isinstance(exc, WorkflowError) else type(exc).__name__)
                 return "", str(exc) if isinstance(exc, WorkflowError) else "ComfyUI 连接或提示词模型调用失败，请检查配置"
         module = self._get_comfyui_module()
@@ -23617,8 +23632,8 @@ class ImageGenerationRuntime(ProactiveMessageMixin):
         }
         available = (
             backends.get(selected, False)
-            if selected != "auto"
-            else any(backends.get(name, False) for name in ("external", "comfyui", "sdgen", "tool_call"))
+            if selected not in {"auto", "external_first"}
+            else any(backends.get(name, False) for name in ("external", "comfyui", "sdgen"))
         )
         return {
             "installed": True,

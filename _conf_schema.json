@@ -28,9 +28,10 @@
         "hint": "填写列表中的文件名或名称。"
       },
       "selfie_workflow": {
-        "description": "默认自拍／改图工作流",
+        "description": "有参考图的自拍／改图工作流",
         "type": "string",
-        "default": ""
+        "default": "",
+        "hint": "无参考图的自拍使用文生图工作流，有参考图才使用本项。"
       },
       "rewrite_enabled": {
         "description": "按工作流重写和拆分提示词",
@@ -194,7 +195,7 @@
         "description": "生图后端",
         "type": "string",
         "default": "auto",
-        "options": ["auto", "external", "comfyui", "sdgen", "tool_call", "anima_master"],
+        "options": ["auto", "external_first", "external", "comfyui", "sdgen", "tool_call", "anima_master"],
         "hint": "anima_master 直连已启用的 Anima 绘图大师，复用其 ComfyUI/模型配置；图片由陪伴插件统一发送。"
       },
       "external_image_api_platform": {
