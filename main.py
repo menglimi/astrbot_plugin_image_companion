@@ -425,10 +425,21 @@ class ImageCompanionExtensionAPI:
         return await runtime._maybe_cleanup_generated_photos(force=True)
 
     async def generate_for_companion(self, owner: Any, request: dict[str, Any]) -> dict[str, Any]:
-        if not self._host_available():
+        private_api = self._plugin._private_companion_api()
+        if private_api is None:
             return {"handled": False, "reason": "private_companion_required"}
         if not self._plugin.enabled:
             return {"handled": False, "reason": "disabled"}
+        # ImageTask callers pass data only. Resolve the legacy migration source
+        # inside the service, using the current host after every plugin reload.
+        if owner is None:
+            owner = getattr(private_api, "_plugin", None)
+        if owner is None:
+            return {
+                "handled": False,
+                "reason": "private_companion_required",
+                "note": "陪伴主插件尚未就绪，生图后端不可用。",
+            }
         try:
             runtime = ImageGenerationRuntime(self._plugin, owner)
             backend, image_path, note = await runtime.generate(dict(request or {}))
