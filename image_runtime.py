@@ -15584,6 +15584,10 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             # use its common documented ceiling while preserving prompt-side
             # projection when a request carries more assets.
             return min(requested, 3)
+        if platform == "doubao":
+            # Ark Seedream 4.0 and later accept reference images on the regular
+            # ``/images/generations`` call; four stays well below the API limit.
+            return min(requested, 4)
         if platform != "openai" or not self._external_image_model_supports_multi_reference(
             endpoint.get("model")
         ):
@@ -18639,11 +18643,29 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         prompt_text: str,
         *,
         session_key: str,
+        reference_image_path: str = "",
+        reference_image_paths: Any = (),
         image_size: str = "",
     ) -> tuple[str, str]:
         endpoint = self._doubao_generation_endpoint()
         if not endpoint:
             return "", "未配置豆包/火山方舟 API 地址"
+        raw_reference_paths = reference_image_paths
+        if isinstance(raw_reference_paths, str):
+            raw_reference_paths = (raw_reference_paths,)
+        doubao_reference_paths: list[str] = []
+        for raw_path in (reference_image_path, *(raw_reference_paths or ())):
+            clean_path = _path_text(raw_path, 1000)
+            if clean_path and clean_path not in doubao_reference_paths:
+                doubao_reference_paths.append(clean_path)
+        # Ark accepts reference images on the same /images/generations call;
+        # keep the application-side ceiling well below the documented 10.
+        doubao_reference_images: list[str] = []
+        for clean_path in doubao_reference_paths[:4]:
+            data_url = await self._reference_image_to_data_url(clean_path)
+            if not data_url:
+                return "", "豆包/火山方舟参考图无法读取或转换为 Data URI，已停止纯文生图回退"
+            doubao_reference_images.append(data_url)
         try:
             import aiohttp
 
@@ -18652,6 +18674,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 "prompt": prompt_text,
                 "size": self._sanitize_external_image_size(image_size),
             }
+            if doubao_reference_images:
+                payload["image"] = doubao_reference_images
             headers = {
                 "Authorization": f"Bearer {self.external_image_api_key}",
                 "Content-Type": "application/json",
@@ -18659,10 +18683,11 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             headers.update(self._external_image_custom_headers())
             timeout = aiohttp.ClientTimeout(total=float(self.external_image_api_timeout_seconds))
             logger.info(
-                "[PrivateCompanion] 豆包/火山方舟生图提交: endpoint=%s model=%s size=%s prompt_preview=%s",
+                "[PrivateCompanion] 豆包/火山方舟生图提交: endpoint=%s model=%s size=%s reference=%s prompt_preview=%s",
                 self._external_image_diagnostic_text(endpoint, 160),
                 _single_line(self.external_image_api_model, 80),
                 _single_line(payload["size"], 40),
+                len(doubao_reference_images),
                 _single_line(prompt_text, 180),
             )
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -19756,12 +19781,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 )
             )
         if platform == "doubao":
-            if reference_image_path:
-                return "", "豆包/火山方舟文生图接口暂不支持参考图输入，请改用 Gemini、OpenAI 兼容参考图接口或 ComfyUI images=1 工作流"
             return self._coerce_external_photo_generation_outcome(
                 await self._run_doubao_photo_generation(
                     prompt_text,
                     session_key=session_key,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
                     image_size=image_size,
                 )
             )

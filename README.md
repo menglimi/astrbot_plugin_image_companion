@@ -155,7 +155,7 @@ API 根地址即可，插件会补齐生成或编辑路径；也接受直接填�
 | MiniMax | `minimax` | `https://api.minimaxi.com/v1` 或 `https://api.minimax.io/v1`；`image-01`/`image-01-live` | 统一调用 `/image_generation`；每次最多提交 1 张 PNG/JPEG 参考图 |
 | 阿里云百炼 | `bailian` | `https://dashscope.aliyuncs.com/api/v1`；`qwen-image`、`wan` 系列 | Qwen/Wan 优先使用多模态 `input.messages`；带参考图时不会回退为纯文生图 |
 | 魔搭社区 | `modelscope` | 使用魔搭 API 根地址；填写对应图片模型 | 使用异步任务和轮询；当前不接收参考图 |
-| 豆包/火山方舟 | `doubao` | 使用 Ark API 根地址（通常 `/api/v3`）；`seedream`/`doubao-seedream` | 调用图片生成接口；当前不接收参考图 |
+| 豆包/火山方舟 | `doubao` | 使用 Ark API 根地址（通常 `/api/v3`）；`seedream`/`doubao-seedream` | 调用 `/images/generations`；Seedream 4.0 及以后接受 `image` 参考图，最多提交 4 张 |
 | Gemini | `gemini` | `https://generativelanguage.googleapis.com/v1beta`；支持图片输出的 Gemini 模型 | 调用 `models/{model}:generateContent`，支持文本和参考图；不适用于 Imagen 的 `:predict` 接口 |
 
 `平台`填 `auto` 时会根据地址和模型名自动识别。Agnes、SenseNova 等兼容值也可以直接写入
@@ -313,9 +313,9 @@ NAI 路线只负责 NovelAI 标签和负面提示词编译。若使用 NovelAI �
 
 ### 参考图能力速查
 
-- 支持参考图：正确配置的 OpenAI 兼容编辑接口、OpenRouter、Agnes、MiniMax、Gemini，以及
-  声明 `images>=1` 的 ComfyUI 工作流。
-- 当前纯文生图：SenseNova U1 Fast、SDGen、魔搭社区、豆包/火山方舟。
+- 支持参考图：正确配置的 OpenAI 兼容编辑接口、OpenRouter、Agnes、MiniMax、Gemini、豆包/火山
+  方舟的 Seedream 4.0 及以后模型，以及声明 `images>=1` 的 ComfyUI 工作流。
+- 当前纯文生图：SenseNova U1 Fast、SDGen、魔搭社区。
 - 百炼的 Qwen/Wan 图片模型使用多模态协议；带参考图时必须保证模型和端点支持该协议。
 - Anima 绘图大师在开启实验性 `img2img_enabled` 后支持单张原图重绘。
 - 参考图库只负责提供素材，最终能提交几张图由所选后端的能力上限决定；超出上限时会保留主
